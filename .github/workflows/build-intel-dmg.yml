@@ -2,6 +2,8 @@ name: Build Intel macOS DMG
 
 on:
   workflow_dispatch:
+  push:
+    branches: [intel-dmg]
 
 jobs:
   build:
