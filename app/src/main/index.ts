@@ -11,7 +11,7 @@ import Database from 'better-sqlite3';
 import { writeHeartbeat } from './indexer.ts';
 import { createIndexerService } from './indexer-service.ts';
 import { createWorkerBuildIndex } from './indexer-worker-client.ts';
-import { createIndexLog } from './remote-index-log.ts';
+import { createIndexLog, isDebugLoggingEnabled } from './remote-index-log.ts';
 import { createStallWatchdog, type IndexEvent, type IndexProgress } from './index-progress.ts';
 import { formatElapsed } from '../shared/index-progress.mjs';
 import { previewLocalMarkdownLink, resolveExistingLocalMarkdownFile } from './local-markdown-link.mjs';
@@ -331,7 +331,16 @@ interface RemoteRuntime {
 const REMOTE_STALL_MS = 60_000;
 const REMOTE_WATCHDOG_TICK_MS = 5_000;
 const MAX_LOGGED_SKIPS_PER_BUILD = 200;
-const remoteLog = createIndexLog({ filePath: path.join(os.homedir(), '.trajex', 'remote-index.log') });
+// Debug logging is opt-in (Settings > Debug logging, or env TRAJEX_DEBUG=1). The flag is
+// cached so a log call never re-reads settings.json; settings:set refreshes it live.
+let debugLoggingOn = false;
+function refreshDebugLogging(persisted: { debugLogging?: unknown } = loadPersistedSettings()) {
+  debugLoggingOn = isDebugLoggingEnabled(persisted);
+}
+const remoteLog = createIndexLog({
+  filePath: path.join(os.homedir(), '.trajex', 'remote-index.log'),
+  enabled: () => debugLoggingOn,
+});
 
 const remoteDbs = new Map<string, any>();
 const remoteRuntime = new Map<string, RemoteRuntime>();
@@ -704,7 +713,7 @@ async function summarizeRemote(remote: RemoteSource, { checkPaths = false } = {}
     stalledSeconds: runtime.stalledSeconds || 0,
     lastBuild: runtime.lastBuild ?? null,
     hasIndex: info.lastIndexedAt !== '',
-    logPath: remoteLog.filePath,
+    logPath: debugLoggingOn ? remoteLog.filePath : '',
   };
 }
 
@@ -814,6 +823,7 @@ function createWindow() {
 const TRAJEX_DIR = path.join(os.homedir(), '.trajex');
 
 app.whenReady().then(() => {
+  refreshDebugLogging();
   startBackgroundResources({ runStartupBuild: true });
   createWindow();
 
@@ -1249,6 +1259,9 @@ ipcMain.handle('settings:get', async () => {
     codexDir,
     dbPath: dbFile,
     autoRefresh: persisted.autoRefresh !== false,
+    debugLogging: persisted.debugLogging === true,
+    debugLoggingForced: isDebugLoggingEnabled({}),
+    debugLogPath: remoteLog.filePath,
     sources,
     memoryCount,
     sessionCount,
@@ -1264,6 +1277,7 @@ ipcMain.handle('settings:set', async (_, key, value) => {
   const persisted = loadPersistedSettings();
   const providerRootChanged = setPersistedSetting(persisted, key, value);
   savePersistedSettings(persisted);
+  if (key === 'debugLogging') refreshDebugLogging(persisted);
 
   if (key === 'autoRefresh') {
     await stopIndexerServiceAndWait();

@@ -25,6 +25,7 @@ import { formatProjectLabel } from './utils.js';
 import { buildSidebarProjects } from './sidebar-projects.mjs';
 import { resolveGlobalShortcut } from './keyboard-shortcuts.mjs';
 import { sourceLabel } from './source-catalog.mjs';
+import { locationBadgeCount } from './location-counts.mjs';
 import { describeProgress, shortProgress } from '../../shared/index-progress.mjs';
 import trajexIcon from './assets/trajex-icon.svg';
 
@@ -53,7 +54,12 @@ const routeSession = computed(() => {
 const activeCount = computed(() => state.memories.filter(m => !m.archived).length);
 const archivedCount = computed(() => state.memories.filter(m => m.archived).length);
 const totalMemoryCount = computed(() => state.memories.length);
-const sessionCount = computed(() => state.sessions.length);
+// Until the active location's list has loaded, fall back to its index count instead of flashing 0.
+const sessionCount = computed(() => (
+  state.loaded || state.sessions.length
+    ? state.sessions.length
+    : locationBadgeCount(state.locations.find(loc => loc.id === state.location))
+));
 
 const currentRouteType = computed(() => {
   const name = route.name;
@@ -302,7 +308,7 @@ function setSourceFilter(id) {
             <span v-else-if="loc.status === 'indexing'" class="badge indexing-badge" :title="locationHint(loc)">
               <span class="indexing-dot"></span>{{ shortProgress(state.remoteProgress[loc.id]?.progress ?? loc.progress) }}
             </span>
-            <span v-else class="badge">{{ loc.id === state.location ? sessionCount : loc.sessionCount }}</span>
+            <span v-else class="badge">{{ locationBadgeCount(loc) }}</span>
           </button>
         </div>
 

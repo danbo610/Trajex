@@ -8,6 +8,12 @@
 
 - Remote index progress and diagnostics: while a remote builds, Settings shows phase, `done / total files (provider)`, elapsed time, a progress bar and the current file, and the sidebar location shows a pulsing indicator with a percentage; the first index of a remote explains that large/network directories take minutes. After a build Settings shows last-indexed time, session count and build summary, and the last error stays visible (a failed build can no longer stay on "Indexing…"). `~/.trajex/remote-index.log` (rotated at 2 MB) records build start/end, phase timings, per-provider discovery counts, skipped files, unreachable roots, errors with stacks and a "no progress for 60s" watchdog note.
 
+- Settings → Debug logging (off by default, or env `TRAJEX_DEBUG=1`) controls whether `~/.trajex/remote-index.log` is written; it takes effect immediately. Errors remain visible in Settings either way.
+
+### Fixed
+
+- Sidebar location counts no longer flash 0 right after selecting a location (the badge read the length of the just-cleared session list); counts now come from each location's index summary.
+
 ### Changed
 
 - 普通增量索引只为 `project_path` 为空的受影响会话推导项目根目录，Codex/Pi 全量重放也会跨 `delete-session` 保留已解析路径；不再重扫长会话的全部 `cwd` 历史或用后续子目录覆盖项目根，force rebuild 仍会完整重新计算。

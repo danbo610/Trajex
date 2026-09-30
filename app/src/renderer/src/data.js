@@ -7,6 +7,7 @@
 
 import { markRaw } from 'vue';
 import { state } from './store.js';
+import { mergeLocations } from './location-counts.mjs';
 import { liveSessionKey } from './session-live.mjs';
 import {
   applySessionPatch,
@@ -68,7 +69,7 @@ export async function loadLocations() {
   if (!window.trajex?.getLocations) return;
   try {
     const locations = await window.trajex.getLocations();
-    if (Array.isArray(locations) && locations.length) state.locations = locations;
+    if (Array.isArray(locations) && locations.length) state.locations = mergeLocations(state.locations, locations);
   } catch (error) {
     console.error('Failed to load locations:', error);
   }

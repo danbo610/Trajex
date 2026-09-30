@@ -15,12 +15,24 @@ import path from 'node:path';
 export const REMOTE_INDEX_LOG_MAX_BYTES = 2 * 1024 * 1024;
 const MAX_LINE_CHARS = 4000;
 
+/** Debug logging is opt-in: settings.json `debugLogging: true` or env TRAJEX_DEBUG=1. */
+export function isDebugLoggingEnabled(
+  persisted: { debugLogging?: unknown } | null | undefined,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  const flag = String(env.TRAJEX_DEBUG ?? '').trim().toLowerCase();
+  if (flag === '1' || flag === 'true') return true;
+  return persisted?.debugLogging === true;
+}
+
 export type LogLevel = 'INFO' | 'WARN' | 'ERROR';
 
 export interface IndexLogOptions {
   filePath: string;
   maxBytes?: number;
   now?: () => Date;
+  /** Evaluated on every write; when it returns false nothing touches the disk. */
+  enabled?: () => boolean;
   fsImpl?: Pick<typeof fs, 'appendFileSync' | 'statSync' | 'renameSync' | 'rmSync' | 'mkdirSync'>;
 }
 
@@ -40,6 +52,7 @@ export function createIndexLog({
   filePath,
   maxBytes = REMOTE_INDEX_LOG_MAX_BYTES,
   now = () => new Date(),
+  enabled = () => true,
   fsImpl = fs,
 }: IndexLogOptions) {
   let size: number | null = null;
@@ -66,6 +79,7 @@ export function createIndexLog({
 
   const write = (level: LogLevel, scope: string, message: string) => {
     try {
+      if (!enabled()) return;
       const line = formatLogLine(now(), level, scope, message);
       if (currentSize() + Buffer.byteLength(line) > maxBytes) rotate();
       fsImpl.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -78,6 +92,7 @@ export function createIndexLog({
 
   return {
     filePath,
+    isEnabled: () => { try { return enabled(); } catch { return false; } },
     info: (scope: string, message: string) => write('INFO', scope, message),
     warn: (scope: string, message: string) => write('WARN', scope, message),
     error: (scope: string, message: string, error?: unknown) => write(

@@ -12,6 +12,9 @@ defineOptions({ name: 'Settings' });
 const sources = ref([]);
 const dbPath = ref('');
 const autoRefresh = ref(true);
+const debugLogging = ref(false);
+const debugLoggingForced = ref(false);
+const debugLogPath = ref('');
 const memoryCount = ref(0);
 const rebuilding = ref(false);
 const rebuildError = ref('');
@@ -75,6 +78,9 @@ async function loadSettings() {
   sources.value = s.sources || [];
   dbPath.value = s.dbPath || '';
   autoRefresh.value = s.autoRefresh !== false;
+  debugLogging.value = s.debugLogging === true;
+  debugLoggingForced.value = s.debugLoggingForced === true;
+  debugLogPath.value = s.debugLogPath || '';
   memoryCount.value = s.memoryCount || 0;
   version.value = s.version || '';
   syncRemotes(s.remotes || []);
@@ -172,6 +178,12 @@ async function browseSourcePath(source) {
 async function toggleAutoRefresh() {
   autoRefresh.value = !autoRefresh.value;
   await saveSetting('autoRefresh', autoRefresh.value);
+}
+
+async function toggleDebugLogging() {
+  debugLogging.value = !debugLogging.value;
+  await saveSetting('debugLogging', debugLogging.value);
+  await loadSettings();
 }
 
 async function saveSetting(key, value) {
@@ -315,7 +327,7 @@ function fmtRelative(iso) {
                   First index of this remote: large or network directories (e.g. SMB shares with >1 GB of history) can take several minutes. You can keep using Trajex; this page updates automatically.
                 </div>
                 <div v-if="stalledSeconds(remote) >= 60" class="index-progress-note warn">
-                  No progress for {{ stalledSeconds(remote) }}s — the share may be slow or disconnected. Details: <code>{{ remote.logPath }}</code>
+                  No progress for {{ stalledSeconds(remote) }}s — the share may be slow or disconnected. <template v-if="remote.logPath">Details: <code>{{ remote.logPath }}</code></template><template v-else>Turn on “Debug logging” below for details.</template>
                 </div>
               </div>
               <div v-else-if="remote.lastBuild" class="index-progress-note">
@@ -390,6 +402,23 @@ function fmtRelative(iso) {
           </span>
           <span class="toggle-text">Watch data sources for changes</span>
         </label>
+      </section>
+
+      <!-- Debug logging -->
+      <section class="settings-section">
+        <div class="settings-section-head">
+          <h2>Debug logging</h2>
+          <p>Write remote index diagnostics (build timings, skipped files, errors) to a log file. Off by default.</p>
+        </div>
+        <label class="toggle-label" @click.prevent="toggleDebugLogging">
+          <span class="toggle-track" :class="{ on: debugLogging || debugLoggingForced }">
+            <span class="toggle-thumb"></span>
+          </span>
+          <span class="toggle-text">Debug logging</span>
+        </label>
+        <div v-if="debugLoggingForced" class="index-progress-note">Forced on by the TRAJEX_DEBUG=1 environment variable.</div>
+        <div v-if="debugLogging || debugLoggingForced" class="index-progress-note">Log file: <code>{{ debugLogPath }}</code> (rotated at 2 MB)</div>
+        <div v-else class="index-progress-note">Errors are still shown on each remote above.</div>
       </section>
 
       <!-- About -->
