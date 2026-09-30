@@ -29,6 +29,7 @@ import { runWriteTransaction, configureConnection, betterSqliteTransactionAdapte
 import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migrations.ts';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { runRetryableWriteTransaction, isBeginBusyFailure, hasUnusableTransaction } from '../../../packages/core/src/write-coordinator.ts';
+import { createProgressReporter, type IndexEvent, type IndexProgress } from './index-progress.ts';
 import { inferProjectPath } from '../../../packages/core/src/parsing.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -179,6 +180,10 @@ interface BuildIndexOptions {
   writerLeasePath?: string;
   writerLeaseWaitMs?: number;
   writerLeaseMode?: 'acquire' | 'caller-held';
+  /** Throttled (~250 ms) progress snapshots; used by the remote-index UI. */
+  onProgress?: (progress: IndexProgress) => void;
+  /** Discrete events (phase changes, per-provider discovery, skipped files) for logging. */
+  onEvent?: (event: IndexEvent) => void;
 }
 
 interface SkippedFile {
@@ -236,7 +241,11 @@ function buildIndex({
   writerLeasePath = writerLockPathFor(dbPath),
   writerLeaseWaitMs = 2000,
   writerLeaseMode = 'acquire',
+  onProgress,
+  onEvent,
 }: BuildIndexOptions = {}): BuildIndexResult {
+  const reporter = onProgress || onEvent ? createProgressReporter({ onProgress, onEvent }) : null;
+  reporter?.begin();
   if (writerLeaseMode !== 'acquire' && writerLeaseMode !== 'caller-held') {
     throw new Error(`Unknown writer lease mode: ${writerLeaseMode}`);
   }
@@ -296,6 +305,10 @@ function buildIndex({
         force,
         changedPaths,
         priorSessions,
+        onDiscover: reporter ? ({ provider, stage, units }) => {
+          if (stage === 'start') reporter.discoverStart(provider);
+          else reporter.discoverDone(provider, units ?? 0);
+        } : undefined,
       });
       if (!force && providerPlan.fullRebuild && providerPlan.inventoryIssues.length > 0) {
         return {
@@ -372,11 +385,14 @@ function buildIndex({
         }
       }
       const skipped: SkippedFile[] = [];
+      reporter?.startIndexing(providerPlan.items.map(({ provider }) => ({ provider: provider.name })));
       const providerResult = indexProviderPlan({
         db,
         plan: providerPlan,
         runTransaction: (label, work) => runRetryableWriteTransaction(txDb, work, { label }),
-        onCommitted: ({ unit }, nextCursor) => {
+        onItemStart: reporter ? ({ provider, unit }) => reporter.itemStart(provider.name, unit.key) : undefined,
+        onCommitted: ({ provider, unit }, nextCursor) => {
+          reporter?.itemDone(provider.name);
           if (nextCursor) latestSourceMtime = Math.max(latestSourceMtime, Number(nextCursor.split(':')[0]) || 0);
           if (unit.sessionId) affectedSessionIds.add(unit.sessionId);
           for (const sessionId of unit.retractSessionIds ?? []) affectedSessionIds.add(sessionId);
@@ -389,6 +405,7 @@ function buildIndex({
             error: (error as Error).message,
             diagnostics: (error as { trajex?: unknown }).trajex,
           });
+          reporter?.itemSkipped(provider.name, unit.key, (error as Error).message);
           console.warn(`Warning: failed to index ${provider.name} unit ${unit.key}: ${(error as Error).message}`);
           return 'skip';
         },
@@ -404,6 +421,7 @@ function buildIndex({
         });
       }
       let ftsRebuilt = false;
+      reporter?.finalizing();
       // Finalize is one transaction; a failure here fails the whole build (the
       // index would otherwise be left inconsistent).
       try {
@@ -440,6 +458,7 @@ function buildIndex({
         throw error;
       }
       for (const sessionId of finalizeAffectedSessionIds) affectedSessionIds.add(sessionId);
+      reporter?.finish();
       return {
         files: providerPlan.items.length,
         latestSourceMtime,

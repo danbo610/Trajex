@@ -4,6 +4,7 @@
 
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 import type {
+  RemoteIndexProgressPayload,
   RemoteProviderRootsConfig,
   SessionPatch,
   SessionPatchCursor,
@@ -51,6 +52,11 @@ contextBridge.exposeInMainWorld('trajex', {
     const listener = () => callback();
     ipcRenderer.on('trajex:remotes-updated', listener);
     return () => ipcRenderer.removeListener('trajex:remotes-updated', listener);
+  },
+  onRemoteIndexProgress: (callback: (payload: RemoteIndexProgressPayload) => void) => {
+    const listener = (_: IpcRendererEvent, payload: RemoteIndexProgressPayload) => callback(payload);
+    ipcRenderer.on('trajex:remote-index-progress', listener);
+    return () => ipcRenderer.removeListener('trajex:remote-index-progress', listener);
   },
   addRemote: (input?: { name?: string; providerRoots?: RemoteProviderRootsConfig }) => ipcRenderer.invoke('remotes:add', input),
   updateRemote: (id: string, patch: { name?: string; providerRoots?: RemoteProviderRootsConfig }) => ipcRenderer.invoke('remotes:update', id, patch),

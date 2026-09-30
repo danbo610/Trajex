@@ -10,7 +10,12 @@ const port = parentPort;
 
 port.on('message', ({ id, args }: { id: number; args?: Record<string, unknown> }) => {
   try {
-    const result = buildIndex(args || {});
+    const { reportProgress, ...buildArgs } = (args || {}) as Record<string, unknown>;
+    const progressHooks = reportProgress ? {
+      onProgress: (progress: unknown) => port.postMessage({ id, progress }),
+      onEvent: (event: unknown) => port.postMessage({ id, event }),
+    } : {};
+    const result = buildIndex({ ...buildArgs, ...progressHooks });
     port.postMessage({ id, result });
   } catch (error) {
     port.postMessage({

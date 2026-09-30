@@ -114,10 +114,13 @@ export function createProviderIndexPlan(
     force = false,
     changedPaths,
     priorSessions,
+    onDiscover,
   }: {
     force?: boolean;
     changedPaths?: string[];
     priorSessions?: readonly ProviderSessionProvenance[];
+    /** Optional progress hook: fired before/after each provider's (synchronous) discovery. */
+    onDiscover?: (event: { provider: string; stage: 'start' | 'done'; units?: number }) => void;
   } = {},
 ): ProviderIndexPlan {
   const items: ProviderIndexItem[] = [];
@@ -144,6 +147,7 @@ export function createProviderIndexPlan(
       markerMissing.get(provider.name) === true
       && providerSessions.length > 0
     );
+    onDiscover?.({ provider: provider.name, stage: 'start' });
     const units = provider.discover({
       lastCursor: fullReindex ? () => null : (key) => storedProviderCursor(db, key),
       changedPaths: fullReindex ? undefined : changedPaths,
@@ -154,6 +158,7 @@ export function createProviderIndexPlan(
         inventoryIssues.push({ provider: provider.name, ...issue });
       },
     });
+    onDiscover?.({ provider: provider.name, stage: 'done', units: units.length });
     for (const unit of units) {
       items.push({
         provider,
@@ -182,6 +187,7 @@ export function indexProviderPlan({
   runTransaction,
   onPersisted = () => {},
   onCommitted = () => {},
+  onItemStart,
   onError,
 }: {
   db: SqliteDb;
@@ -190,11 +196,14 @@ export function indexProviderPlan({
   /** persist 成功后、同一事务提交前运行派生数据收尾。 */
   onPersisted?: (item: ProviderIndexItem, cursor: Cursor) => void;
   onCommitted?: (item: ProviderIndexItem, cursor: Cursor) => void;
+  /** Optional progress hook: fired before each unit is parsed. */
+  onItemStart?: (item: ProviderIndexItem) => void;
   onError: (error: unknown, item: ProviderIndexItem) => 'skip' | 'stop';
 }): ProviderIndexResult {
   const committed: ProviderIndexItem[] = [];
   const failedProviders = new Set<string>();
   for (const item of plan.items) {
+    onItemStart?.(item);
     try {
       const cursor = runTransaction(`provider:${item.provider.name}:${item.unit.key}`, () => {
         const nextCursor = persist(db, item.unit, item.provider.parse(item.unit, item.cursor));

@@ -118,6 +118,12 @@
   flex-shrink: 0; padding: 2px 0;
 }
 .sidebar-item.active .badge { color: var(--fg-2); }
+.sidebar-item .indexing-badge { display: inline-flex; align-items: center; justify-content: flex-end; gap: 5px; color: var(--accent-2); }
+.indexing-dot {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--accent-2);
+  animation: indexing-pulse 1.2s ease-in-out infinite;
+}
+@keyframes indexing-pulse { 0%, 100% { opacity: 0.25; } 50% { opacity: 1; } }
 .sidebar-item.warning .badge {
   color: var(--danger); background: var(--danger-soft);
   padding: 2px 6px; border-radius: 8px;

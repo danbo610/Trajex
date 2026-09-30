@@ -25,6 +25,7 @@ import { formatProjectLabel } from './utils.js';
 import { buildSidebarProjects } from './sidebar-projects.mjs';
 import { resolveGlobalShortcut } from './keyboard-shortcuts.mjs';
 import { sourceLabel } from './source-catalog.mjs';
+import { describeProgress, shortProgress } from '../../shared/index-progress.mjs';
 import trajexIcon from './assets/trajex-icon.svg';
 
 const router = useRouter();
@@ -153,7 +154,10 @@ function handleSelectLocation(id) {
 
 function locationHint(loc) {
   if (loc.status === 'unreachable') return 'unreachable — showing last index';
-  if (loc.status === 'indexing') return 'indexing…';
+  if (loc.status === 'indexing') {
+    const live = describeProgress(state.remoteProgress[loc.id]?.progress ?? loc.progress);
+    return live || 'indexing…';
+  }
   if (loc.status === 'error') return loc.error || 'index error';
   return '';
 }
@@ -295,7 +299,9 @@ function setSourceFilter(id) {
             </svg>
             <span class="label">{{ loc.name }}</span>
             <span v-if="loc.status === 'unreachable' || loc.status === 'error'" class="badge" style="color:#f87171;">!</span>
-            <span v-else-if="loc.status === 'indexing'" class="badge">…</span>
+            <span v-else-if="loc.status === 'indexing'" class="badge indexing-badge" :title="locationHint(loc)">
+              <span class="indexing-dot"></span>{{ shortProgress(state.remoteProgress[loc.id]?.progress ?? loc.progress) }}
+            </span>
             <span v-else class="badge">{{ loc.id === state.location ? sessionCount : loc.sessionCount }}</span>
           </button>
         </div>

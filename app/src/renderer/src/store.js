@@ -27,6 +27,8 @@ export const state = reactive({
   // Active data location: 'local' or a remote id. Sessions/projects/stats in
   // this store always belong to this location; memories are always local.
   location: 'local',
+  // Live index progress per remote id: { [id]: { progress, stalledSeconds } }.
+  remoteProgress: {},
   locations: [{ id: 'local', name: 'Local', kind: 'local', sessionCount: 0, status: 'ok', statusText: '', error: '' }],
 });
 

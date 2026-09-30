@@ -11,6 +11,9 @@ import Database from 'better-sqlite3';
 import { writeHeartbeat } from './indexer.ts';
 import { createIndexerService } from './indexer-service.ts';
 import { createWorkerBuildIndex } from './indexer-worker-client.ts';
+import { createIndexLog } from './remote-index-log.ts';
+import { createStallWatchdog, type IndexEvent, type IndexProgress } from './index-progress.ts';
+import { formatElapsed } from '../shared/index-progress.mjs';
 import { previewLocalMarkdownLink, resolveExistingLocalMarkdownFile } from './local-markdown-link.mjs';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import {
@@ -306,12 +309,29 @@ function startIndexerService({ buildOnStart = false } = {}) {
 const REMOTE_REFRESH_MS = 5 * 60 * 1000;
 
 type RemoteRuntimeState = 'idle' | 'indexing' | 'ok' | 'unreachable' | 'error';
+interface RemoteBuildSummary {
+  finishedAt: string;
+  durationMs: number;
+  files: number;
+  skipped: number;
+  force: boolean;
+}
 interface RemoteRuntime {
   state: RemoteRuntimeState;
   lastAttemptAt?: string;
   lastSuccessAt?: string;
   error?: string;
+  /** Live progress of the running build (cleared when it ends). */
+  progress?: IndexProgress | null;
+  /** Seconds without a progress message (set by the watchdog while building). */
+  stalledSeconds?: number;
+  lastBuild?: RemoteBuildSummary;
 }
+
+const REMOTE_STALL_MS = 60_000;
+const REMOTE_WATCHDOG_TICK_MS = 5_000;
+const MAX_LOGGED_SKIPS_PER_BUILD = 200;
+const remoteLog = createIndexLog({ filePath: path.join(os.homedir(), '.trajex', 'remote-index.log') });
 
 const remoteDbs = new Map<string, any>();
 const remoteRuntime = new Map<string, RemoteRuntime>();
@@ -428,11 +448,35 @@ function removeRemoteDbFiles(id: string) {
   cleanupDbFiles(remoteWriterLeasePath(TRAJEX_DIR, id));
 }
 
+function notifyRemoteProgress(id: string, progress: IndexProgress | null, stalledSeconds = 0) {
+  for (const win of BrowserWindow.getAllWindows()) {
+    win.webContents.send('trajex:remote-index-progress', { id, progress, stalledSeconds });
+  }
+}
+
+function logIndexEvent(id: string, event: IndexEvent, counters: { skips: number }) {
+  const scope = `remote:${id}`;
+  if (event.type === 'phase') {
+    const total = event.total === undefined ? '' : ` files=${event.total}`;
+    remoteLog.info(scope, `phase=${event.phase} at +${formatElapsed(event.elapsedMs)} (${event.elapsedMs}ms)${total}`);
+  } else if (event.type === 'discovered') {
+    remoteLog.info(scope, `discovered provider=${event.provider} units=${event.units} in ${event.ms}ms`);
+  } else if (event.type === 'skipped') {
+    counters.skips += 1;
+    if (counters.skips <= MAX_LOGGED_SKIPS_PER_BUILD) {
+      remoteLog.warn(scope, `skipped file provider=${event.provider} path=${event.path} error=${event.error}`);
+    } else if (counters.skips === MAX_LOGGED_SKIPS_PER_BUILD + 1) {
+      remoteLog.warn(scope, `further skipped files are not logged individually (limit ${MAX_LOGGED_SKIPS_PER_BUILD})`);
+    }
+  }
+}
+
 async function runRemoteBuild(id: string, { force = false, reason = 'remote-refresh' } = {}) {
   const remote = findRemote(id);
   if (!remote || remoteStopped) return null;
   const runtime = remoteRuntimeFor(id);
   const roots = configuredRemoteRoots(remote);
+  const scope = `remote:${id}`;
   runtime.lastAttemptAt = new Date().toISOString();
   if (roots.length === 0) {
     runtime.state = 'idle';
@@ -445,12 +489,51 @@ async function runRemoteBuild(id: string, { force = false, reason = 'remote-refr
   if (!reachability.some(Boolean)) {
     runtime.state = 'unreachable';
     runtime.error = 'Remote directories are not reachable; keeping the previous index';
+    remoteLog.warn(scope, `unreachable roots (${reason}): ${roots.map(({ provider, path: root }) => `${provider}=${root}`).join(', ')}`);
     notifyRemotesUpdated();
     return null;
   }
+  const unreachableRoots = roots.filter((_, index) => !reachability[index]);
+  const buildStartedAt = Date.now();
   runtime.state = 'indexing';
   runtime.error = undefined;
+  runtime.stalledSeconds = 0;
+  runtime.progress = {
+    phase: 'discovering', done: 0, total: 0, provider: null, providerDone: 0, providerTotal: 0,
+    currentFile: null, skipped: 0, startedAt: buildStartedAt, elapsedMs: 0, updatedAt: buildStartedAt,
+  };
+  remoteLog.info(scope, `build start name="${remote.name}" reason=${reason} force=${force} roots=${roots.map(({ provider, path: root }) => `${provider}=${root}`).join(', ')}`);
+  for (const { provider, path: root } of unreachableRoots) {
+    remoteLog.warn(scope, `root not reachable, will be skipped: ${provider}=${root}`);
+  }
   notifyRemotesUpdated();
+  notifyRemoteProgress(id, runtime.progress);
+
+  const watchdog = createStallWatchdog({ thresholdMs: REMOTE_STALL_MS });
+  const watchdogTimer = setInterval(() => {
+    const silentMs = watchdog.check();
+    if (silentMs === null) return;
+    runtime.stalledSeconds = Math.round(silentMs / 1000);
+    const at = runtime.progress;
+    remoteLog.warn(scope, `no progress for ${runtime.stalledSeconds}s (phase=${at?.phase} done=${at?.done}/${at?.total} provider=${at?.provider} file=${at?.currentFile ?? '-'}); the share may be slow or disconnected`);
+    notifyRemoteProgress(id, runtime.progress ?? null, runtime.stalledSeconds);
+  }, REMOTE_WATCHDOG_TICK_MS);
+  watchdogTimer.unref?.();
+  const counters = { skips: 0 };
+  let finishedResult: any = null;
+  const observer = {
+    onProgress: (progress: IndexProgress) => {
+      watchdog.touch();
+      runtime.stalledSeconds = 0;
+      // The UI clock starts when the build was requested, not when the worker woke up.
+      runtime.progress = { ...progress, startedAt: buildStartedAt };
+      notifyRemoteProgress(id, runtime.progress);
+    },
+    onEvent: (event: IndexEvent) => {
+      watchdog.touch();
+      logIndexEvent(id, event, counters);
+    },
+  };
 
   const dbPath = remoteDbFile(id);
   const writerLeasePath = remoteWriterLeasePath(TRAJEX_DIR, id);
@@ -473,41 +556,70 @@ async function runRemoteBuild(id: string, { force = false, reason = 'remote-refr
           preserveDbPath: fs.existsSync(dbPath) ? dbPath : null,
           writerLeasePath,
           writerLeaseMode: 'caller-held',
-        });
+        }, observer);
         if (!(result as any)?.deferred) {
           closeRemoteDb(id);
           replaceDbWithTemp(tempDbPath, dbPath);
+          remoteLog.info(scope, `replaced index with rebuilt database (${tempDbPath} -> ${dbPath})`);
         }
       } finally {
         cleanupDbFiles(tempDbPath);
         lease?.release();
       }
     } else {
-      result = await worker.buildIndex({ reason, ...buildArgs, dbPath, writerLeasePath });
+      result = await worker.buildIndex({ reason, ...buildArgs, dbPath, writerLeasePath }, observer);
     }
     closeRemoteDb(id);
+    const durationMs = Date.now() - buildStartedAt;
     if (result?.deferred) {
       runtime.state = runtime.lastSuccessAt ? 'ok' : 'idle';
       runtime.error = `Index busy (${String(result.reason || 'deferred').replaceAll('_', ' ')}); will retry`;
+      remoteLog.warn(scope, `build deferred reason=${result.reason} after ${formatElapsed(durationMs)}`);
     } else if (Array.isArray(result?.inventoryIssues) && result.inventoryIssues.length > 0) {
       runtime.state = 'unreachable';
       runtime.lastSuccessAt = new Date().toISOString();
       runtime.error = `Some remote directories could not be read (${result.inventoryIssues[0].path}); kept the previous index for them`;
+      for (const issue of result.inventoryIssues) {
+        remoteLog.warn(scope, `inventory issue provider=${issue.provider} path=${issue.path} error=${issue.error}`);
+      }
     } else {
       runtime.state = 'ok';
       runtime.lastSuccessAt = new Date().toISOString();
       runtime.error = undefined;
     }
-    notifyRemotesUpdated();
-    notifyIndexUpdated(result ?? {}, id);
+    if (!result?.deferred) {
+      runtime.lastBuild = {
+        finishedAt: new Date().toISOString(),
+        durationMs,
+        files: Number(result?.files) || 0,
+        skipped: Number(result?.skipped) || 0,
+        force,
+      };
+    }
+    finishedResult = result ?? {};
+    const info = readRemoteIndexInfo(id);
+    remoteLog.info(scope, `build end state=${runtime.state} files=${result?.files ?? 0} skipped=${result?.skipped ?? 0} sessionsTouched=${result?.affectedSessionIds?.length ?? 0} sessions=${info.sessionCount} ftsRebuilt=${result?.ftsRebuilt ?? false} duration=${formatElapsed(durationMs)} (${durationMs}ms)`);
     return result;
   } catch (error) {
+    const durationMs = Date.now() - buildStartedAt;
     runtime.state = force ? 'error' : (runtime.lastSuccessAt ? 'unreachable' : 'error');
-    runtime.error = (error as Error).message;
-    notifyRemotesUpdated();
-    if (force) throw error;
+    runtime.error = (error as Error).message || String(error);
+    remoteLog.error(scope, `build failed after ${formatElapsed(durationMs)} (${durationMs}ms)`, error);
     console.warn?.(`Trajex remote index failed (${id}): ${(error as Error).message}`);
+    if (force) throw error;
     return null;
+  } finally {
+    clearInterval(watchdogTimer);
+    // Whatever happened, never leave the remote on "Indexing…".
+    if (runtime.state === 'indexing') {
+      runtime.state = 'error';
+      runtime.error = runtime.error || 'Indexing ended unexpectedly';
+    }
+    runtime.progress = null;
+    runtime.stalledSeconds = 0;
+    notifyRemoteProgress(id, null);
+    notifyRemotesUpdated();
+    if (finishedResult) notifyIndexUpdated(finishedResult, id);
   }
 }
 
@@ -588,6 +700,11 @@ async function summarizeRemote(remote: RemoteSource, { checkPaths = false } = {}
       : status === 'error' ? 'Index error'
       : configured.length === 0 ? 'No directories configured' : 'Waiting for first scan',
     error: runtime.error || '',
+    progress: runtime.progress ?? null,
+    stalledSeconds: runtime.stalledSeconds || 0,
+    lastBuild: runtime.lastBuild ?? null,
+    hasIndex: info.lastIndexedAt !== '',
+    logPath: remoteLog.filePath,
   };
 }
 
@@ -608,6 +725,7 @@ function listLocations() {
         status: runtime.state,
         statusText: runtime.state === 'unreachable' ? 'unreachable' : runtime.state === 'indexing' ? 'indexing' : '',
         error: runtime.error || '',
+        progress: runtime.progress ?? null,
       };
     }),
   ];

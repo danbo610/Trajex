@@ -57,6 +57,34 @@ export interface RemoteProviderRootsConfig {
   pi?: string;
 }
 
+export interface IndexProgressInfo {
+  phase: 'discovering' | 'indexing' | 'finalizing' | 'done';
+  done: number;
+  total: number;
+  provider: string | null;
+  providerDone: number;
+  providerTotal: number;
+  currentFile: string | null;
+  skipped: number;
+  startedAt: number;
+  elapsedMs: number;
+  updatedAt: number;
+}
+
+export interface RemoteIndexProgressPayload {
+  id: string;
+  progress: IndexProgressInfo | null;
+  stalledSeconds: number;
+}
+
+export interface RemoteBuildSummaryInfo {
+  finishedAt: string;
+  durationMs: number;
+  files: number;
+  skipped: number;
+  force: boolean;
+}
+
 export interface RemoteSummary {
   id: string;
   name: string;
@@ -69,6 +97,12 @@ export interface RemoteSummary {
   status: 'idle' | 'indexing' | 'ok' | 'unreachable' | 'error';
   statusText: string;
   error: string;
+  progress: IndexProgressInfo | null;
+  stalledSeconds: number;
+  lastBuild: RemoteBuildSummaryInfo | null;
+  /** False until the first successful build has written an index. */
+  hasIndex: boolean;
+  logPath: string;
 }
 
 export interface LocationSummary {
@@ -79,4 +113,5 @@ export interface LocationSummary {
   status: string;
   statusText: string;
   error: string;
+  progress?: IndexProgressInfo | null;
 }

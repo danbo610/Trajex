@@ -5,16 +5,24 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Worker } from 'node:worker_threads';
+import type { IndexEvent, IndexProgress } from './index-progress.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 interface WorkerMessage {
   id: number;
   result?: unknown;
+  progress?: IndexProgress;
+  event?: IndexEvent;
   error?: { message: string; stack?: string };
 }
 
-interface PendingBuild {
+export interface BuildObserver {
+  onProgress?: (progress: IndexProgress) => void;
+  onEvent?: (event: IndexEvent) => void;
+}
+
+interface PendingBuild extends BuildObserver {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
 }
@@ -45,6 +53,9 @@ function createWorkerBuildIndex({
     active.on('message', (message: WorkerMessage) => {
       const current = pending.get(message.id);
       if (!current) return;
+      // Progress / event messages keep the build pending.
+      if (message.progress) { current.onProgress?.(message.progress); return; }
+      if (message.event) { current.onEvent?.(message.event); return; }
       pending.delete(message.id);
       if (message.error) {
         const error = new Error(message.error.message);
@@ -65,10 +76,11 @@ function createWorkerBuildIndex({
     return active;
   };
 
-  const buildIndex = (args: Record<string, unknown> = {}) => new Promise((resolve, reject) => {
+  const buildIndex = (args: Record<string, unknown> = {}, observer: BuildObserver = {}) => new Promise((resolve, reject) => {
     const id = nextId++;
-    pending.set(id, { resolve, reject });
-    ensureWorker().postMessage({ id, args });
+    const observed = Boolean(observer.onProgress || observer.onEvent);
+    pending.set(id, { resolve, reject, ...observer });
+    ensureWorker().postMessage({ id, args: observed ? { ...args, reportProgress: true } : args });
   });
 
   const stop = () => {

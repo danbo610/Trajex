@@ -77,6 +77,14 @@ window.trajex?.onRemotesUpdated?.(() => {
   void loadLocations();
 });
 
+window.trajex?.onRemoteIndexProgress?.(({ id, progress, stalledSeconds } = {}) => {
+  if (!id) return;
+  const next = { ...state.remoteProgress };
+  if (progress) next[id] = { progress, stalledSeconds: stalledSeconds || 0 };
+  else delete next[id];
+  state.remoteProgress = next;
+});
+
 window.trajex?.onSessionUpdated?.(({ sessionId, location } = {}) => {
   const route = router.currentRoute.value;
   const currentSessionId = route.name === 'SessionDetail'

@@ -4,6 +4,8 @@
 
 <script setup>
 import { ref, onMounted, onUnmounted, nextTick } from 'vue';
+import { state } from '../store.js';
+import { describeProgress, progressFraction, formatElapsed } from '../../../shared/index-progress.mjs';
 
 defineOptions({ name: 'Settings' });
 
@@ -19,16 +21,53 @@ const remoteBusy = ref({});
 const remoteError = ref({});
 let stopRemotesUpdated = () => {};
 let remotesTimer = null;
+let clockTimer = null;
+// Ticks once a second so "2m 10s" keeps counting between (throttled) progress events.
+const now = ref(Date.now());
 
 onMounted(async () => {
   await loadSettings();
   stopRemotesUpdated = window.trajex?.onRemotesUpdated?.(() => { void loadSettings(); }) || (() => {});
   remotesTimer = setInterval(() => { void loadSettings(); }, 30000);
+  clockTimer = setInterval(() => { now.value = Date.now(); }, 1000);
 });
 onUnmounted(() => {
   stopRemotesUpdated();
   if (remotesTimer) clearInterval(remotesTimer);
+  if (clockTimer) clearInterval(clockTimer);
 });
+
+/** Live progress pushed over IPC, falling back to what settings:get reported. */
+function liveProgress(remote) {
+  return state.remoteProgress?.[remote.id]?.progress || remote.progress || null;
+}
+function stalledSeconds(remote) {
+  return state.remoteProgress?.[remote.id]?.stalledSeconds || remote.stalledSeconds || 0;
+}
+function progressText(remote) {
+  return describeProgress(liveProgress(remote), now.value) || 'Indexing…';
+}
+function progressPercent(remote) {
+  const fraction = progressFraction(liveProgress(remote));
+  return fraction === null ? null : Math.round(fraction * 100);
+}
+function currentFileName(remote) {
+  const file = liveProgress(remote)?.currentFile;
+  if (!file) return '';
+  const parts = String(file).split(/[\\/]/);
+  return parts.slice(-2).join('/');
+}
+function lastBuildText(remote) {
+  const build = remote.lastBuild;
+  if (!build) return '';
+  const skipped = build.skipped ? `, ${build.skipped} skipped` : '';
+  return `${build.files} files${skipped} in ${formatElapsed(build.durationMs)}`;
+}
+function fmtTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleString();
+}
 
 async function loadSettings() {
   if (!window.trajex?.getSettings) return;
@@ -266,7 +305,28 @@ function fmtRelative(iso) {
                   <span>last indexed <strong>{{ fmtRelative(remote.lastIndexed) }}</strong></span>
                 </template>
               </div>
-              <div v-if="remote.error" class="reset-error">{{ remote.error }}</div>
+              <div v-if="remote.status === 'indexing'" class="index-progress">
+                <div class="index-progress-text">{{ progressText(remote) }}</div>
+                <div class="index-progress-bar" :class="{ indeterminate: progressPercent(remote) === null }">
+                  <div class="index-progress-fill" :style="progressPercent(remote) === null ? {} : { width: progressPercent(remote) + '%' }"></div>
+                </div>
+                <div v-if="currentFileName(remote)" class="index-progress-file" :title="liveProgress(remote).currentFile">{{ currentFileName(remote) }}</div>
+                <div v-if="!remote.hasIndex" class="index-progress-note">
+                  First index of this remote: large or network directories (e.g. SMB shares with >1 GB of history) can take several minutes. You can keep using Trajex; this page updates automatically.
+                </div>
+                <div v-if="stalledSeconds(remote) >= 60" class="index-progress-note warn">
+                  No progress for {{ stalledSeconds(remote) }}s — the share may be slow or disconnected. Details: <code>{{ remote.logPath }}</code>
+                </div>
+              </div>
+              <div v-else-if="remote.lastBuild" class="index-progress-note">
+                Last build: {{ lastBuildText(remote) }}<template v-if="remote.lastBuild.force"> (full rebuild)</template>
+              </div>
+              <div v-if="remote.lastIndexed" class="index-progress-note" :title="fmtTime(remote.lastIndexed)">
+                Last indexed {{ fmtTime(remote.lastIndexed) }} · {{ remote.sessionCount }} sessions
+              </div>
+              <div v-if="remote.error" class="reset-error">
+                Last error: {{ remote.error }}<template v-if="remote.logPath"> (log: <code>{{ remote.logPath }}</code>)</template>
+              </div>
               <div v-if="remoteError[remote.id]" class="reset-error">{{ remoteError[remote.id] }}</div>
             </div>
             <div class="remote-actions">
@@ -386,6 +446,18 @@ function fmtRelative(iso) {
 .root-state.ok { color: #34d399; }
 .root-state.error { color: #f87171; }
 .root-state.muted { color: var(--muted); }
+.index-progress { margin: 8px 0 4px; max-width: 520px; }
+.index-progress-text { font-size: 12px; color: var(--fg-2); font-variant-numeric: tabular-nums; margin-bottom: 4px; }
+.index-progress-bar { height: 4px; border-radius: 2px; background: rgba(255,255,255,0.10); overflow: hidden; position: relative; }
+.index-progress-fill { height: 100%; background: #fbbf24; transition: width 0.25s linear; }
+.index-progress-bar.indeterminate .index-progress-fill {
+  position: absolute; width: 30%; animation: index-progress-slide 1.4s ease-in-out infinite;
+}
+@keyframes index-progress-slide { 0% { left: -30%; } 100% { left: 100%; } }
+.index-progress-file { font-family: var(--font-mono); font-size: 10.5px; color: var(--muted); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.index-progress-note { font-size: 11.5px; color: var(--muted); margin-top: 6px; line-height: 1.45; }
+.index-progress-note.warn { color: #fbbf24; }
+.index-progress-note code, .reset-error code { font-family: var(--font-mono); font-size: 10.5px; }
 .remote-db { font-size: 11px; color: var(--muted); }
 .remote-db code { font-family: var(--font-mono); font-size: 10.5px; }
 
