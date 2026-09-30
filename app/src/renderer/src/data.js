@@ -7,6 +7,7 @@
 
 import { markRaw } from 'vue';
 import { state } from './store.js';
+import { liveSessionKey } from './session-live.mjs';
 import {
   applySessionPatch,
   createSessionPatchCursor,
@@ -16,9 +17,13 @@ import { assembleSessionDetail } from '../../shared/session-detail-assembly.mjs'
 const sessionMessageSnapshots = new Map();
 const MAX_SESSION_MESSAGE_SNAPSHOTS = 3;
 
-function rememberSessionMessageSnapshot(sessionId, entry) {
-  sessionMessageSnapshots.delete(sessionId);
-  sessionMessageSnapshots.set(sessionId, entry);
+function snapshotKey(sessionId, location = 'local') {
+  return liveSessionKey(location, sessionId);
+}
+
+function rememberSessionMessageSnapshot(key, entry) {
+  sessionMessageSnapshots.delete(key);
+  sessionMessageSnapshots.set(key, entry);
   while (sessionMessageSnapshots.size > MAX_SESSION_MESSAGE_SNAPSHOTS) {
     sessionMessageSnapshots.delete(sessionMessageSnapshots.keys().next().value);
   }
@@ -47,17 +52,30 @@ function commitStoredSessionMetadata(sessionId, metadata) {
  * then gate a reply that started before SessionDetail became active.
  */
 export async function fetchInitialData() {
+  const location = state.location;
+  const remote = location !== 'local';
   const [rawMemories, rawSessions, stats, projects] = await Promise.all([
     window.trajex.getMemories(),
-    window.trajex.getSessions({ source: 'all', limit: 1000 }),
-    window.trajex.getStats(),
-    window.trajex.getProjects()
+    window.trajex.getSessions({ source: 'all', limit: 1000, location }),
+    window.trajex.getStats({ location, ...(remote ? { source: 'all' } : {}) }),
+    window.trajex.getProjects({ location, ...(remote ? { source: 'all' } : {}) })
   ]);
-  return { rawMemories, rawSessions, stats, projects };
+  return { rawMemories, rawSessions, stats, projects, location };
+}
+
+/** Sidebar location list (Local + configured remotes with index status). */
+export async function loadLocations() {
+  if (!window.trajex?.getLocations) return;
+  try {
+    const locations = await window.trajex.getLocations();
+    if (Array.isArray(locations) && locations.length) state.locations = locations;
+  } catch (error) {
+    console.error('Failed to load locations:', error);
+  }
 }
 
 /** Commit a fetched global catalogue snapshot to shared renderer state. */
-export function commitInitialData({ rawMemories, rawSessions, stats, projects }) {
+export function commitInitialData({ rawMemories, rawSessions, stats, projects, location = 'local' }) {
   // Transform memories: DB records -> render-layer shape
   state.memories = (rawMemories || []).map(m => ({
     ...m,
@@ -66,6 +84,9 @@ export function commitInitialData({ rawMemories, rawSessions, stats, projects })
     archivedAt: m.deleted_at ? new Date(m.deleted_at).getTime() : null,
     markdown: null  // loaded on demand via loadMemoryMarkdown
   }));
+
+  // A reply for a location the user already left must not overwrite the current one.
+  if (location !== state.location) return;
 
   // The catalogue now owns the latest metadata; route overlays can retire.
   state.sessionTitleOverrides.clear();
@@ -91,14 +112,14 @@ export function commitInitialData({ rawMemories, rawSessions, stats, projects })
  *
  * Returns the assembled session object (also updates state.sessions entry).
  */
-export async function loadSessionDetail(sessionId) {
+export async function loadSessionDetail(sessionId, location = 'local') {
   const [messages, toolCalls, toolResults, subagents, workflows, summaries] = await Promise.all([
-    window.trajex.getSessionMessages(sessionId),
-    window.trajex.getSessionToolCalls(sessionId),
-    window.trajex.getSessionToolResults(sessionId),
-    window.trajex.getSessionSubagents(sessionId),
-    window.trajex.getSessionWorkflows(sessionId),
-    window.trajex.getSessionSummaries(sessionId),
+    window.trajex.getSessionMessages(sessionId, location),
+    window.trajex.getSessionToolCalls(sessionId, location),
+    window.trajex.getSessionToolResults(sessionId, location),
+    window.trajex.getSessionSubagents(sessionId, location),
+    window.trajex.getSessionWorkflows(sessionId, location),
+    window.trajex.getSessionSummaries(sessionId, location),
   ]);
   const detail = assembleSessionDetail({ messages, toolCalls, toolResults, subagents, workflows, summaries });
   const snapshot = {
@@ -107,7 +128,7 @@ export async function loadSessionDetail(sessionId) {
     summaries: detail.summaries,
   };
   const metadata = sessionMetadata(state.sessions.find(candidate => candidate.id === sessionId));
-  rememberSessionMessageSnapshot(sessionId, {
+  rememberSessionMessageSnapshot(snapshotKey(sessionId, location), {
     snapshot,
     cursor: createSessionPatchCursor(snapshot),
     session: metadata,
@@ -115,17 +136,17 @@ export async function loadSessionDetail(sessionId) {
   return commitSessionDetail(sessionId, snapshot, { updateStore: true, metadata });
 }
 
-export async function fetchSessionDetailPatch(sessionId) {
-  const current = sessionMessageSnapshots.get(sessionId);
+export async function fetchSessionDetailPatch(sessionId, location = 'local') {
+  const current = sessionMessageSnapshots.get(snapshotKey(sessionId, location));
   if (!current || typeof window.trajex.getSessionPatch !== 'function') {
-    return { sessionId, current: null, patch: null };
+    return { sessionId, location, current: null, patch: null };
   }
-  const patch = await window.trajex.getSessionPatch(sessionId, current.cursor);
-  return { sessionId, current, patch };
+  const patch = await window.trajex.getSessionPatch(sessionId, current.cursor, location);
+  return { sessionId, location, current, patch };
 }
 
-export async function materializeSessionDetailPatch({ sessionId, current, patch }) {
-  if (!current || !patch) return loadSessionDetail(sessionId);
+export async function materializeSessionDetailPatch({ sessionId, location = 'local', current, patch }) {
+  if (!current || !patch) return loadSessionDetail(sessionId, location);
   const next = applySessionPatch(current.snapshot, current.cursor, patch);
   const metadata = sessionMetadata(patch.session) || current.session;
   const latest = commitSessionDetail(sessionId, next.snapshot, {
@@ -133,8 +154,9 @@ export async function materializeSessionDetailPatch({ sessionId, current, patch 
     metadata,
   });
   latest.acceptMessagePatch = () => {
-    if (sessionMessageSnapshots.get(sessionId) !== current) return false;
-    rememberSessionMessageSnapshot(sessionId, { ...next, session: metadata });
+    const key = snapshotKey(sessionId, location);
+    if (sessionMessageSnapshots.get(key) !== current) return false;
+    rememberSessionMessageSnapshot(key, { ...next, session: metadata });
     commitStoredSessionMetadata(sessionId, metadata);
     return true;
   };
@@ -151,8 +173,8 @@ export async function materializeSessionDetailPatch({ sessionId, current, patch 
   return latest;
 }
 
-export function getCachedSessionDetail(sessionId) {
-  const current = sessionMessageSnapshots.get(sessionId);
+export function getCachedSessionDetail(sessionId, location = 'local') {
+  const current = sessionMessageSnapshots.get(snapshotKey(sessionId, location));
   if (!current) return null;
   return commitSessionDetail(sessionId, current.snapshot, {
     updateStore: false,
@@ -182,12 +204,12 @@ function commitSessionDetail(sessionId, { messages, workflows = [], summaries = 
  * Load full detail for a subagent conversation.
  * Returns assembled messages with tool_calls inline.
  */
-export async function loadSubagentDetail(agentId) {
+export async function loadSubagentDetail(agentId, location = 'local') {
   const [messages, toolCalls, toolResults, summaries] = await Promise.all([
-    window.trajex.getSubagentMessages(agentId),
-    window.trajex.getSubagentToolCalls(agentId),
-    window.trajex.getSubagentToolResults(agentId),
-    window.trajex.getSubagentSummaries(agentId),
+    window.trajex.getSubagentMessages(agentId, location),
+    window.trajex.getSubagentToolCalls(agentId, location),
+    window.trajex.getSubagentToolResults(agentId, location),
+    window.trajex.getSubagentSummaries(agentId, location),
   ]);
   const detail = assembleSessionDetail({
     messages,
@@ -213,9 +235,9 @@ export function isTextTruncated(text) {
  * Fetch the full untruncated text for a message from its source JSONL.
  * Returns the full text string or null.
  */
-export async function loadFullText(uuid) {
+export async function loadFullText(uuid, location = 'local') {
   try {
-    return await window.trajex.getMessageFullText(uuid);
+    return await window.trajex.getMessageFullText(uuid, location);
   } catch {
     return null;
   }

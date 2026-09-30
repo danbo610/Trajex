@@ -21,7 +21,7 @@ function esmResolve(specifier) {
 
 test('Activity requests usage across all indexed providers', () => {
   const source = readFileSync(new URL('../app/src/renderer/src/views/Activity.vue', import.meta.url), 'utf8');
-  assert.match(source, /getUsageStats\(\{\s*source:\s*['"]all['"]\s*\}\)/);
+  assert.match(source, /getUsageStats\(\{\s*source:\s*['"]all['"](?:,\s*location)?\s*\}\)/);
   assert.match(source, /onIndexUpdated\?\.\(\(\)\s*=>\s*\{?\s*(?:void\s+)?loadUsageStats\(\)/s);
   assert.match(source, /Array\.from\(\{\s*length:\s*loadedMonths\.value\s*\}/);
   assert.doesNotMatch(source, /monthBlocks\s*=\s*ref\(/);

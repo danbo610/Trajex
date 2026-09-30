@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Remote sources: Settings → Data Sources is split into Local and Remote. A remote is another machine's `.claude` / `.codex` / `.pi/agent/sessions` reached through a mounted folder; it is indexed read-only into its own local database `~/.trajex/remote-<id>.sqlite` (never merged with `trajex.sqlite`), re-scanned every 5 minutes or on demand, and keeps its previous index when unreachable. The sidebar gets a Local / Remote location layer for Sessions and Activity; Memory stays local. Routes are now `/l/:loc/sessions…` and `/l/:loc/activity` (old URLs redirect to `local`). Local file links are disabled in remote sessions.
+
 ### Changed
 
 - 普通增量索引只为 `project_path` 为空的受影响会话推导项目根目录，Codex/Pi 全量重放也会跨 `delete-session` 保留已解析路径；不再重扫长会话的全部 `cwd` 历史或用后续子目录覆盖项目根，force rebuild 仍会完整重新计算。

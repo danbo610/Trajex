@@ -5,7 +5,7 @@
 <script setup>
 import { ref, shallowRef, computed, reactive, onMounted, onBeforeUnmount, onUnmounted, nextTick, watch } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
-import { state, FOLDER_SVG, getSessionSummary } from '../store.js';
+import { state, FOLDER_SVG, getSessionSummary, isRemoteLocation } from '../store.js';
 import {
   fetchSessionDetailPatch,
   getCachedSessionDetail,
@@ -13,7 +13,7 @@ import {
   loadFullText,
   materializeSessionDetailPatch,
 } from '../data.js';
-import { clearSessionDirty, consumeGlobalSessionDirty, markSessionDirty } from '../session-live.mjs';
+import { clearSessionDirty, consumeGlobalSessionDirty, liveSessionKey, markSessionDirty } from '../session-live.mjs';
 import { applySnapshot } from '../session-timeline.mjs';
 import { reconcileTimelineItems } from '../session-timeline-items.mjs';
 import { createSessionDisclosureState } from '../session-disclosures.mjs';
@@ -35,10 +35,14 @@ import {
 import { sourceColor, sourceLabel } from '../source-catalog.mjs';
 
 defineOptions({ name: 'SessionDetail' });
-const props = defineProps({ id: String });
+const props = defineProps({ id: String, loc: String });
 
 const router = useRouter();
 const route = useRoute();
+// The data location this session belongs to ('local' or a remote id).
+const location = String(route.params.loc || 'local');
+const isRemote = location !== 'local';
+const liveKey = liveSessionKey(location, props.id);
 
 // --- Reactive state ---
 const liveSessionMetadata = shallowRef(null);
@@ -62,7 +66,7 @@ let removeSessionUpdated = null;
 let keydownAttached = false;
 let focusTimer = null;
 let loadRevision = 0;
-let pendingReaderState = sessionReaderStateCache.get(props.id);
+let pendingReaderState = sessionReaderStateCache.get(liveKey);
 let readerStatePrepared = false;
 
 // DOM refs
@@ -116,7 +120,7 @@ function observeSessionHeader() {
   headerResizeObserver.observe(headerRef.value);
 }
 
-function saveReaderState(sessionId = props.id) {
+function saveReaderState(sessionId = liveKey) {
   if (!timelineReady.value || !sessionId || timelineItems.value.length === 0) return;
   sessionReaderStateCache.set(sessionId, {
     ...timelineViewport.captureReaderPosition(),
@@ -198,8 +202,9 @@ onMounted(async () => {
   active.value = true;
   userScroll.attach(wrapRef.value);
   attachKeydown();
-  removeSessionUpdated = window.trajex?.onSessionUpdated?.(({ sessionId } = {}) => {
+  removeSessionUpdated = window.trajex?.onSessionUpdated?.(({ sessionId, location: updatedLocation } = {}) => {
     if (!active.value || !props.id || sessionId !== props.id) return;
+    if ((updatedLocation || 'local') !== location) return;
     void liveReloadCoordinator.request();
   }) || null;
   if (!localStorage.getItem(HINT_KEY)) {
@@ -207,7 +212,7 @@ onMounted(async () => {
     localStorage.setItem(HINT_KEY, '1');
     setTimeout(() => { showFontHint.value = false; }, 4000);
   }
-  await loadMessages({ force: consumeGlobalSessionDirty(props.id) });
+  await loadMessages({ force: consumeGlobalSessionDirty(liveKey) });
   await nextTick();
   syncTimelineScrollMargin();
   observeSessionHeader();
@@ -298,11 +303,11 @@ async function revealColdTimeline(revision, sessionId) {
 }
 
 async function fetchSessionSnapshot(sessionId, { force = false } = {}) {
-  const messageSnapshot = force ? null : getCachedSessionDetail(sessionId);
+  const messageSnapshot = force ? null : getCachedSessionDetail(sessionId, location);
   if (messageSnapshot) return messageSnapshot;
   const cached = state.sessions.find(session => session.id === sessionId);
   if (cached && (force || !cached.messages || cached.messages.length === 0)) {
-    return loadSessionDetail(sessionId);
+    return loadSessionDetail(sessionId, location);
   }
   return cached;
 }
@@ -313,24 +318,24 @@ async function loadLiveSnapshot() {
   // Live reload ordering is owned by the coordinator. Capture the current
   // full-load generation so a patch cannot invalidate cold-open layout work.
   const revision = loadRevision;
-  const patchRequest = await fetchSessionDetailPatch(sessionId);
+  const patchRequest = await fetchSessionDetailPatch(sessionId, location);
   return { sessionId, revision, patchRequest };
 }
 
 async function commitLiveSnapshot(snapshot) {
   if (snapshot.revision !== loadRevision || snapshot.sessionId !== props.id) {
-    markSessionDirty(snapshot.sessionId);
+    markSessionDirty(liveSessionKey(location, snapshot.sessionId));
     return;
   }
   const latest = await materializeSessionDetailPatch(snapshot.patchRequest);
   if (snapshot.revision !== loadRevision || snapshot.sessionId !== props.id) {
-    markSessionDirty(snapshot.sessionId);
+    markSessionDirty(liveSessionKey(location, snapshot.sessionId));
     return;
   }
   await commitSessionSnapshot(latest);
   const accepted = latest?.acceptMessagePatch?.() ?? true;
-  if (accepted) clearSessionDirty(snapshot.sessionId);
-  else markSessionDirty(snapshot.sessionId);
+  if (accepted) clearSessionDirty(liveSessionKey(location, snapshot.sessionId));
+  else markSessionDirty(liveSessionKey(location, snapshot.sessionId));
 }
 
 async function commitSessionSnapshot(latest) {
@@ -553,7 +558,7 @@ function navToMessage(target) {
 function navToSession(direction) {
   const target = sessionNavigationList.value[currentSessionIndex.value + direction];
   if (!target) return;
-  router.push({ name: 'SessionDetail', params: { id: target.id } });
+  router.push({ name: 'SessionDetail', params: { loc: location, id: target.id } });
 }
 
 // --- Full text loading ---
@@ -561,7 +566,7 @@ async function handleLoadFullText(uuid) {
   if (fullTextLoading.has(uuid)) return;
   fullTextLoading.add(uuid);
   try {
-    const fullText = await loadFullText(uuid);
+    const fullText = await loadFullText(uuid, location);
     if (fullText && messages.value.some(message => message.uuid === uuid)) {
       expandedMessageText.set(uuid, fullText);
     }
@@ -574,14 +579,14 @@ async function handleLoadFullText(uuid) {
 function navigateToSubagent(agentId) {
   router.push({
     name: 'SubagentDetail',
-    params: { id: props.id, agentId }
+    params: { loc: location, id: props.id, agentId }
   });
 }
 
 </script>
 
 <template>
-  <div class="detail-wrap" ref="wrapRef" @scroll="onScroll" :style="{ '--text-base': fontSize, '--text-md': fontSize }">
+  <div class="detail-wrap" ref="wrapRef" :data-remote-session="isRemote ? 'true' : null" @scroll="onScroll" :style="{ '--text-base': fontSize, '--text-md': fontSize }">
     <div class="detail">
       <!-- Loading state -->
       <div v-if="loading || !timelineReady" class="empty first-open-loading">
@@ -595,7 +600,8 @@ function navigateToSubagent(agentId) {
             <span class="project-icon" v-html="FOLDER_SVG"></span>
             <span class="project-name">{{ formatProjectLabel(session.project) }}</span>
             <span class="sep">&middot;</span>
-            <span class="project-path">{{ session.project_path || '' }}</span>
+            <span v-if="isRemote" class="project-path" title="Path on the remote machine">{{ session.project_path || '' }}</span>
+            <span v-else class="project-path">{{ session.project_path || '' }}</span>
             <span class="via">
               <span class="via-dot" :style="{ '--source-color': sourceColor(session.source, state.sources) }"></span>
               via {{ sourceLabel(session.source, state.sources) }}

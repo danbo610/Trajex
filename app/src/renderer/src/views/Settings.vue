@@ -3,7 +3,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 
 <script setup>
-import { ref, onMounted, nextTick } from 'vue';
+import { ref, onMounted, onUnmounted, nextTick } from 'vue';
 
 defineOptions({ name: 'Settings' });
 
@@ -14,9 +14,20 @@ const memoryCount = ref(0);
 const rebuilding = ref(false);
 const rebuildError = ref('');
 const version = ref('');
+const remotes = ref([]);
+const remoteBusy = ref({});
+const remoteError = ref({});
+let stopRemotesUpdated = () => {};
+let remotesTimer = null;
 
 onMounted(async () => {
   await loadSettings();
+  stopRemotesUpdated = window.trajex?.onRemotesUpdated?.(() => { void loadSettings(); }) || (() => {});
+  remotesTimer = setInterval(() => { void loadSettings(); }, 30000);
+});
+onUnmounted(() => {
+  stopRemotesUpdated();
+  if (remotesTimer) clearInterval(remotesTimer);
 });
 
 async function loadSettings() {
@@ -27,6 +38,87 @@ async function loadSettings() {
   autoRefresh.value = s.autoRefresh !== false;
   memoryCount.value = s.memoryCount || 0;
   version.value = s.version || '';
+  syncRemotes(s.remotes || []);
+}
+
+// Keep text the user is typing (names) while refreshing status fields.
+function syncRemotes(next) {
+  const editing = new Map(remotes.value.map(r => [r.id, r]));
+  remotes.value = next.map(r => {
+    const prev = editing.get(r.id);
+    return { ...r, nameDraft: prev && prev.nameDraft !== prev.name ? prev.nameDraft : r.name };
+  });
+}
+
+const PROVIDER_FIELDS = [
+  { key: 'claude', label: 'Claude root', hint: '~/.claude', placeholder: 'e.g. /Volumes/other-mac/.claude' },
+  { key: 'codex', label: 'Codex root', hint: '~/.codex', placeholder: 'e.g. /Volumes/other-mac/.codex' },
+  { key: 'pi', label: 'Pi sessions dir', hint: '~/.pi/agent/sessions', placeholder: 'e.g. /Volumes/other-mac/.pi/agent/sessions' },
+];
+
+async function guarded(id, fn) {
+  remoteBusy.value = { ...remoteBusy.value, [id]: true };
+  remoteError.value = { ...remoteError.value, [id]: '' };
+  try {
+    await fn();
+  } catch (error) {
+    remoteError.value = { ...remoteError.value, [id]: error instanceof Error ? error.message : String(error) };
+  } finally {
+    remoteBusy.value = { ...remoteBusy.value, [id]: false };
+    await loadSettings();
+  }
+}
+
+async function addRemote() {
+  if (!window.trajex?.addRemote) return;
+  await window.trajex.addRemote({ name: `Remote ${remotes.value.length + 1}`, providerRoots: {} });
+  await loadSettings();
+}
+
+async function pickRemoteHome(remote) {
+  const picked = await window.trajex?.pickRemoteHome?.();
+  if (!picked) return;
+  const found = Object.keys(picked.providerRoots || {}).length;
+  await guarded(remote.id, async () => {
+    if (!found) throw new Error(`No .claude, .codex or .pi/agent/sessions found in ${picked.home}`);
+    await window.trajex.updateRemote(remote.id, { providerRoots: { ...remote.providerRoots, ...picked.providerRoots } });
+  });
+}
+
+async function browseRemoteRoot(remote, field) {
+  const result = await window.trajex?.browseFolder?.();
+  if (!result) return;
+  await guarded(remote.id, () => window.trajex.updateRemote(remote.id, {
+    providerRoots: { ...remote.providerRoots, [field.key]: result },
+  }));
+}
+
+async function clearRemoteRoot(remote, field) {
+  const roots = { ...remote.providerRoots };
+  delete roots[field.key];
+  await guarded(remote.id, () => window.trajex.updateRemote(remote.id, { providerRoots: roots }));
+}
+
+async function commitRemoteRoot(remote, field, value) {
+  const trimmed = String(value || '').trim();
+  if (trimmed === (remote.providerRoots[field.key] || '')) return;
+  const roots = { ...remote.providerRoots };
+  if (trimmed) roots[field.key] = trimmed; else delete roots[field.key];
+  await guarded(remote.id, () => window.trajex.updateRemote(remote.id, { providerRoots: roots }));
+}
+
+async function commitRemoteName(remote) {
+  const name = String(remote.nameDraft || '').trim();
+  if (!name || name === remote.name) { remote.nameDraft = remote.name; return; }
+  await guarded(remote.id, () => window.trajex.updateRemote(remote.id, { name }));
+}
+
+const refreshRemote = remote => guarded(remote.id, () => window.trajex.refreshRemote(remote.id));
+const rebuildRemote = remote => guarded(remote.id, () => window.trajex.rebuildRemote(remote.id));
+
+async function deleteRemote(remote) {
+  if (!window.confirm(`Delete "${remote.name}"?\n\nThis removes the remote and its local index file. Files on the remote machine are not touched.`)) return;
+  await guarded(remote.id, () => window.trajex.removeRemote(remote.id));
 }
 
 async function browseSourcePath(source) {
@@ -94,6 +186,8 @@ function fmtRelative(iso) {
           <p>Where Trajex reads your agent session history.</p>
         </div>
 
+        <div class="subsection-title">Local</div>
+
         <div
           v-for="src in sources" :key="src.id"
           class="source-card"
@@ -129,6 +223,85 @@ function fmtRelative(iso) {
                 Browse…
               </button>
             </div>
+          </div>
+        </div>
+
+        <div class="subsection-title remote-title">
+          <span>Remote</span>
+          <button class="btn" @click="addRemote" title="Add a remote location">
+            <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M7 2.5v9M2.5 7h9"/></svg>
+            Add
+          </button>
+        </div>
+        <p class="subsection-hint">
+          Read-only history from another machine, reached through a mounted folder (SMB, NFS, sshfs…).
+          Each remote is indexed into its own local database and re-scanned every 5 minutes.
+          Leave a directory blank to skip it.
+        </p>
+        <div v-if="!remotes.length" class="remote-empty">No remotes yet. Use “Add” to create one.</div>
+
+        <div
+          v-for="remote in remotes" :key="remote.id"
+          class="source-card remote-card"
+          :class="{ error: remote.status === 'unreachable' || remote.status === 'error', warn: remote.status === 'idle' }"
+        >
+          <div class="source-card-head remote-head">
+            <div class="source-card-info">
+              <input
+                class="path-field remote-name"
+                type="text"
+                v-model="remote.nameDraft"
+                spellcheck="false"
+                placeholder="Name, e.g. Other Mac"
+                @blur="commitRemoteName(remote)"
+                @keydown.enter.prevent="$event.target.blur()"
+              />
+              <div class="source-card-status">
+                <span class="stat-dot" :class="remote.status === 'ok' ? 'ok' : remote.status === 'indexing' || remote.status === 'idle' ? 'warn' : 'error'"></span>
+                <span class="stat-text" :class="remote.status === 'ok' ? 'ok' : remote.status === 'indexing' || remote.status === 'idle' ? 'warn' : 'error'">{{ remote.statusText }}</span>
+                <span class="sep">·</span>
+                <span><strong>{{ remote.sessionCount }}</strong> sessions</span>
+                <template v-if="remote.lastIndexed">
+                  <span class="sep">·</span>
+                  <span>last indexed <strong>{{ fmtRelative(remote.lastIndexed) }}</strong></span>
+                </template>
+              </div>
+              <div v-if="remote.error" class="reset-error">{{ remote.error }}</div>
+              <div v-if="remoteError[remote.id]" class="reset-error">{{ remoteError[remote.id] }}</div>
+            </div>
+            <div class="remote-actions">
+              <button class="btn" :disabled="remoteBusy[remote.id]" @click="pickRemoteHome(remote)" title="Choose the remote home directory and auto-fill the roots below">Pick home…</button>
+              <button class="btn" :disabled="remoteBusy[remote.id] || remote.status === 'indexing'" @click="refreshRemote(remote)">Refresh</button>
+              <button class="btn" :disabled="remoteBusy[remote.id] || remote.status === 'indexing'" @click="rebuildRemote(remote)">Rebuild</button>
+              <button class="btn subtle" :disabled="remoteBusy[remote.id]" @click="deleteRemote(remote)">Delete</button>
+            </div>
+          </div>
+          <div class="source-card-body">
+            <div v-for="field in PROVIDER_FIELDS" :key="field.key" class="remote-root">
+              <div class="remote-root-label">
+                {{ field.label }} <code>{{ field.hint }}</code>
+                <span
+                  v-if="remote.providerRoots[field.key]"
+                  class="root-state"
+                  :class="remote.roots.find(r => r.provider === field.key)?.exists === false ? 'error' : 'ok'"
+                >{{ remote.roots.find(r => r.provider === field.key)?.exists === false ? 'not found' : 'found' }}</span>
+                <span v-else class="root-state muted">not configured</span>
+              </div>
+              <div class="path-input">
+                <input
+                  class="path-field"
+                  :class="{ error: remote.roots.find(r => r.provider === field.key)?.exists === false }"
+                  type="text"
+                  :value="remote.providerRoots[field.key] || ''"
+                  spellcheck="false"
+                  :placeholder="field.placeholder"
+                  @change="commitRemoteRoot(remote, field, $event.target.value)"
+                />
+                <button class="btn" :disabled="remoteBusy[remote.id]" @click="browseRemoteRoot(remote, field)">Browse…</button>
+                <button v-if="remote.providerRoots[field.key]" class="btn subtle" :disabled="remoteBusy[remote.id]" @click="clearRemoteRoot(remote, field)">Clear</button>
+              </div>
+            </div>
+            <div class="remote-db">Index: <code>{{ remote.dbPath }}</code></div>
           </div>
         </div>
       </section>
@@ -194,6 +367,27 @@ function fmtRelative(iso) {
 <style scoped>
 .settings-wrap { flex: 1; overflow-y: auto; min-height: 0; }
 .settings-content { max-width: 720px; margin: 0 auto; padding: 36px 32px 80px; }
+
+.subsection-title {
+  font-size: 12px; font-weight: 600; color: var(--fg-2); letter-spacing: 0.04em;
+  text-transform: uppercase; margin: 6px 0 10px;
+}
+.subsection-title.remote-title {
+  display: flex; align-items: center; justify-content: space-between; margin-top: 26px;
+}
+.subsection-hint, .remote-empty { font-size: 12px; color: var(--muted); margin: 0 0 12px; }
+.remote-head { display: flex; gap: 12px; align-items: flex-start; }
+.remote-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.remote-name { width: 100%; max-width: 280px; font-family: inherit; font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+.remote-root { display: flex; flex-direction: column; gap: 4px; }
+.remote-root-label { font-size: 12px; color: var(--fg-2); display: flex; gap: 8px; align-items: baseline; }
+.remote-root-label code { font-family: var(--font-mono); font-size: 10.5px; color: var(--muted); }
+.root-state { font-family: var(--font-mono); font-size: 10.5px; }
+.root-state.ok { color: #34d399; }
+.root-state.error { color: #f87171; }
+.root-state.muted { color: var(--muted); }
+.remote-db { font-size: 11px; color: var(--muted); }
+.remote-db code { font-family: var(--font-mono); font-size: 10.5px; }
 
 .settings-section { margin-bottom: 44px; }
 .settings-section.last { margin-bottom: 0; }

@@ -37,3 +37,9 @@ export function consumeSessionDirty(live, sessionId) {
 export function consumeGlobalSessionDirty(sessionId) {
   return consumeSessionDirty(sessionLiveState, sessionId);
 }
+
+/** Dirty/live tracking key: plain id for local (back-compat), `loc:id` for remotes. */
+export function liveSessionKey(location, sessionId) {
+  if (!sessionId) return sessionId;
+  return !location || location === 'local' ? sessionId : `${location}:${sessionId}`;
+}

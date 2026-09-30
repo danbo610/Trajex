@@ -2,8 +2,12 @@
 // Copyright (C) 2026 wutongyuonce and contributors.
 // SPDX-License-Identifier: AGPL-3.0-only
 
+/** 'local' (default) or a remote id; selects which index DB a query reads. */
+export type LocationId = string;
+
 export interface SourceQueryOptions {
   source?: string;
+  location?: LocationId;
 }
 
 export type UsageStatsOptions = SourceQueryOptions;
@@ -45,4 +49,34 @@ export interface SessionPatch {
 export interface AppliedSessionPatch {
   snapshot: Record<SessionPatchTable, SessionPatchRow[]>;
   cursor: SessionPatchCursor;
+}
+
+export interface RemoteProviderRootsConfig {
+  claude?: string;
+  codex?: string;
+  pi?: string;
+}
+
+export interface RemoteSummary {
+  id: string;
+  name: string;
+  providerRoots: RemoteProviderRootsConfig;
+  roots: Array<{ provider: string; path: string; configured: boolean; exists: boolean | null }>;
+  dbPath: string;
+  sessionCount: number;
+  lastIndexed: string;
+  lastAttempt: string;
+  status: 'idle' | 'indexing' | 'ok' | 'unreachable' | 'error';
+  statusText: string;
+  error: string;
+}
+
+export interface LocationSummary {
+  id: LocationId;
+  name: string;
+  kind: 'local' | 'remote';
+  sessionCount: number;
+  status: string;
+  statusText: string;
+  error: string;
 }

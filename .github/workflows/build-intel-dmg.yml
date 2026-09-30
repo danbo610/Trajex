@@ -1,0 +1,29 @@
+name: Build Intel macOS DMG
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [remote-sources]
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: uname -m
+      - run: npm ci
+      - run: npm --prefix app ci
+      - name: Build x64 dmg
+        working-directory: app
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npx electron-vite build && npx electron-builder --mac dmg --x64 --publish never
+      - run: ls -la app/release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Trajex-x64-dmg
+          path: app/release/*.dmg

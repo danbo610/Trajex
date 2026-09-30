@@ -14,6 +14,12 @@ function isLocalHref(href) {
   return typeof href === 'string' && (/^(?:file:|\/|[A-Za-z]:[\\/]|\\\\)/.test(href.trim()));
 }
 
+// Links inside a remote session point at paths on the other machine, so the
+// local preview/open features are disabled there.
+function isRemoteSessionLink(link) {
+  return Boolean(link?.closest('[data-remote-session="true"]'));
+}
+
 function markdownLink(target) {
   return target instanceof Element ? target.closest('.markdown-msg a, .markdown-body a, .markdown-compact a') : null;
 }
@@ -64,6 +70,7 @@ async function previewLink(link) {
 function onPointerOver(event) {
   const link = markdownLink(event.target);
   if (!link || !isLocalHref(link.getAttribute('href')) || link.contains(event.relatedTarget)) return;
+  if (isRemoteSessionLink(link)) return;
   clearTimeout(hideTimer);
   hideTimer = null;
   clearTimeout(hoverTimer);
@@ -85,6 +92,7 @@ function onClick(event) {
   const href = link.getAttribute('href');
   if (isLocalHref(href)) {
     event.preventDefault();
+    if (isRemoteSessionLink(link)) return;
     void window.trajex?.openLocalMarkdownLink?.(href);
   } else if (isWebHref(href)) {
     event.preventDefault();

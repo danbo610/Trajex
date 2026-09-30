@@ -18,11 +18,27 @@ import {
   migrateCoreSchemaColumns,
 } from '../../../packages/core/src/schema-migrations.ts';
 import { createBuiltinProviderRegistry } from '../../../packages/core/src/providers/builtins.ts';
+import { createProviderRegistry } from '../../../packages/core/src/providers/registry.ts';
 import {
   buildSourceCatalog,
   resolveProviderRoots,
   setPersistedSetting,
 } from './provider-settings.ts';
+import {
+  LOCAL_LOCATION,
+  addRemote,
+  configuredRemoteRoots,
+  detectRemoteHomeRoots,
+  isRemoteId,
+  normalizeLocationId,
+  readRemotes,
+  remoteBuildArgs,
+  remoteDbPath,
+  remoteWriterLeasePath,
+  removeRemote,
+  updateRemote,
+  type RemoteSource,
+} from './remote-sources.ts';
 import type {
   SessionPatchCursor,
   SessionPatchSnapshot,
@@ -211,16 +227,25 @@ function runAppDbWrite(work: () => void): boolean {
   }
 }
 
-function notifyIndexUpdated(result: { affectedSessionIds?: unknown } = {}) {
+function notifyIndexUpdated(
+  result: { affectedSessionIds?: unknown } = {},
+  location: string = LOCAL_LOCATION,
+) {
   const affectedSessionIds = Array.isArray(result.affectedSessionIds)
     ? [...new Set(result.affectedSessionIds.filter(Boolean))]
     : [];
-  const payload = { affectedSessionIds };
+  const payload = { affectedSessionIds, location };
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send('trajex:index-updated', payload);
     for (const sessionId of affectedSessionIds) {
-      win.webContents.send('trajex:session-updated', { sessionId });
+      win.webContents.send('trajex:session-updated', { sessionId, location });
     }
+  }
+}
+
+function notifyRemotesUpdated() {
+  for (const win of BrowserWindow.getAllWindows()) {
+    win.webContents.send('trajex:remotes-updated', {});
   }
 }
 
@@ -269,6 +294,326 @@ function startIndexerService({ buildOnStart = false } = {}) {
   return service;
 }
 
+// --- Remote locations ---
+//
+// Each remote is an independent location with its own index DB
+// (~/.trajex/remote-<id>.sqlite). Remote directories are only ever read; the
+// index always lives locally. There is no file watching (network shares give no
+// events): remotes are re-scanned incrementally every REMOTE_REFRESH_MS and on
+// demand. Remote builds run in their own worker and use their own writer-lease
+// file so a slow network scan can never block the local indexer.
+
+const REMOTE_REFRESH_MS = 5 * 60 * 1000;
+
+type RemoteRuntimeState = 'idle' | 'indexing' | 'ok' | 'unreachable' | 'error';
+interface RemoteRuntime {
+  state: RemoteRuntimeState;
+  lastAttemptAt?: string;
+  lastSuccessAt?: string;
+  error?: string;
+}
+
+const remoteDbs = new Map<string, any>();
+const remoteRuntime = new Map<string, RemoteRuntime>();
+let remoteWorker: ReturnType<typeof createWorkerBuildIndex> | null = null;
+let remoteTimer: ReturnType<typeof setInterval> | null = null;
+let remoteQueue: Promise<unknown> = Promise.resolve();
+let remoteStopped = false;
+
+/** Existence check that cannot hang the app on a dead network mount. */
+function pathReachable(target: string, timeoutMs = 4000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    fs.promises.access(target).then(
+      () => { clearTimeout(timer); resolve(true); },
+      () => { clearTimeout(timer); resolve(false); },
+    );
+  });
+}
+
+function remoteRuntimeFor(id: string): RemoteRuntime {
+  let runtime = remoteRuntime.get(id);
+  if (!runtime) {
+    runtime = { state: 'idle' };
+    remoteRuntime.set(id, runtime);
+  }
+  return runtime;
+}
+
+function remoteDbFile(id: string) {
+  return remoteDbPath(TRAJEX_DIR, id);
+}
+
+function closeRemoteDb(id: string) {
+  const handle = remoteDbs.get(id);
+  remoteDbs.delete(id);
+  try { handle?.close(); } catch {}
+}
+
+function closeAllRemoteDbs() {
+  for (const id of [...remoteDbs.keys()]) closeRemoteDb(id);
+}
+
+function openRemoteDb(id: string) {
+  const existing = remoteDbs.get(id);
+  if (existing) return existing;
+  const dbPath = remoteDbFile(id);
+  if (!fs.existsSync(dbPath)) return null;
+  const handle = new Database(dbPath, { readonly: false });
+  handle.pragma('busy_timeout = 5000');
+  const lease = acquireWriterLease({
+    lockPath: remoteWriterLeasePath(TRAJEX_DIR, id),
+    openDb: lockPath => new Database(lockPath),
+    waitMs: 0,
+  });
+  let opened = handle;
+  if (lease) {
+    try {
+      handle.pragma('journal_mode = WAL');
+      migrateDb(handle);
+    } finally {
+      lease.release();
+    }
+  } else if (coreSchemaNeedsMigration(handle)) {
+    handle.close();
+    opened = schemaBlockedDb('writer_busy') as any;
+  }
+  remoteDbs.set(id, opened);
+  return opened;
+}
+
+/** Location id -> open index DB (local keeps the long-lived handle). */
+function dbFor(location?: unknown) {
+  const loc = normalizeLocationId(location);
+  if (loc === null) return null;
+  if (loc === LOCAL_LOCATION) return db ?? null;
+  try {
+    return openRemoteDb(loc);
+  } catch (error) {
+    console.warn?.(`Trajex remote DB open failed (${loc}): ${(error as Error).message}`);
+    return null;
+  }
+}
+
+function findRemote(id: string, persisted = loadPersistedSettings()): RemoteSource | null {
+  return readRemotes(persisted).find((remote) => remote.id === id) ?? null;
+}
+
+/** Registry limited to the remote's configured roots (never falls back to local defaults). */
+function registryForLocation(location?: unknown) {
+  const loc = normalizeLocationId(location);
+  if (loc === null || loc === LOCAL_LOCATION) return getRuntimePaths().providerRegistry;
+  const remote = findRemote(loc);
+  if (!remote) return createProviderRegistry([]);
+  const { providerRoots, enabledProviders } = remoteBuildArgs(remote);
+  return createProviderRegistry(
+    createBuiltinProviderRegistry(providerRoots).list().filter(p => enabledProviders.includes(p.name)),
+  );
+}
+
+function ensureRemoteWorker() {
+  if (!remoteWorker) remoteWorker = createWorkerBuildIndex();
+  return remoteWorker;
+}
+
+function enqueueRemote<T>(work: () => Promise<T>): Promise<T> {
+  const next = remoteQueue.then(work, work);
+  remoteQueue = next.catch(() => undefined);
+  return next;
+}
+
+function removeRemoteDbFiles(id: string) {
+  closeRemoteDb(id);
+  cleanupDbFiles(remoteDbFile(id));
+  cleanupDbFiles(remoteWriterLeasePath(TRAJEX_DIR, id));
+}
+
+async function runRemoteBuild(id: string, { force = false, reason = 'remote-refresh' } = {}) {
+  const remote = findRemote(id);
+  if (!remote || remoteStopped) return null;
+  const runtime = remoteRuntimeFor(id);
+  const roots = configuredRemoteRoots(remote);
+  runtime.lastAttemptAt = new Date().toISOString();
+  if (roots.length === 0) {
+    runtime.state = 'idle';
+    runtime.error = undefined;
+    notifyRemotesUpdated();
+    return null;
+  }
+  // Unreachable share: keep the old index untouched and just report it.
+  const reachability = await Promise.all(roots.map(({ path: root }) => pathReachable(root)));
+  if (!reachability.some(Boolean)) {
+    runtime.state = 'unreachable';
+    runtime.error = 'Remote directories are not reachable; keeping the previous index';
+    notifyRemotesUpdated();
+    return null;
+  }
+  runtime.state = 'indexing';
+  runtime.error = undefined;
+  notifyRemotesUpdated();
+
+  const dbPath = remoteDbFile(id);
+  const writerLeasePath = remoteWriterLeasePath(TRAJEX_DIR, id);
+  const buildArgs = remoteBuildArgs(remote);
+  const tempDbPath = force ? rebuildTempDbPath(dbPath) : null;
+  try {
+    const worker = ensureRemoteWorker();
+    let result: any;
+    if (force && tempDbPath) {
+      cleanupDbFiles(tempDbPath);
+      let lease: ReturnType<typeof acquireWriterLease> = null;
+      try {
+        lease = acquireWriterLease({ lockPath: writerLeasePath, openDb: p => new Database(p), waitMs: 2000 });
+        if (!lease) throw new Error('Remote index writer is busy; rebuild was not started');
+        result = await worker.buildIndex({
+          reason,
+          force: true,
+          ...buildArgs,
+          dbPath: tempDbPath,
+          preserveDbPath: fs.existsSync(dbPath) ? dbPath : null,
+          writerLeasePath,
+          writerLeaseMode: 'caller-held',
+        });
+        if (!(result as any)?.deferred) {
+          closeRemoteDb(id);
+          replaceDbWithTemp(tempDbPath, dbPath);
+        }
+      } finally {
+        cleanupDbFiles(tempDbPath);
+        lease?.release();
+      }
+    } else {
+      result = await worker.buildIndex({ reason, ...buildArgs, dbPath, writerLeasePath });
+    }
+    closeRemoteDb(id);
+    if (result?.deferred) {
+      runtime.state = runtime.lastSuccessAt ? 'ok' : 'idle';
+      runtime.error = `Index busy (${String(result.reason || 'deferred').replaceAll('_', ' ')}); will retry`;
+    } else if (Array.isArray(result?.inventoryIssues) && result.inventoryIssues.length > 0) {
+      runtime.state = 'unreachable';
+      runtime.lastSuccessAt = new Date().toISOString();
+      runtime.error = `Some remote directories could not be read (${result.inventoryIssues[0].path}); kept the previous index for them`;
+    } else {
+      runtime.state = 'ok';
+      runtime.lastSuccessAt = new Date().toISOString();
+      runtime.error = undefined;
+    }
+    notifyRemotesUpdated();
+    notifyIndexUpdated(result ?? {}, id);
+    return result;
+  } catch (error) {
+    runtime.state = force ? 'error' : (runtime.lastSuccessAt ? 'unreachable' : 'error');
+    runtime.error = (error as Error).message;
+    notifyRemotesUpdated();
+    if (force) throw error;
+    console.warn?.(`Trajex remote index failed (${id}): ${(error as Error).message}`);
+    return null;
+  }
+}
+
+function refreshRemote(id: string, options: { force?: boolean; reason?: string } = {}) {
+  return enqueueRemote(() => runRemoteBuild(id, options));
+}
+
+function refreshAllRemotes(reason: string) {
+  for (const remote of readRemotes(loadPersistedSettings())) {
+    void refreshRemote(remote.id, { reason }).catch(() => {});
+  }
+}
+
+function startRemoteScheduler({ buildOnStart = true } = {}) {
+  remoteStopped = false;
+  if (remoteTimer) return;
+  if (buildOnStart && loadPersistedSettings().autoRefresh !== false) refreshAllRemotes('remote-startup');
+  remoteTimer = setInterval(() => {
+    if (loadPersistedSettings().autoRefresh === false) return;
+    refreshAllRemotes('remote-reconcile');
+  }, REMOTE_REFRESH_MS);
+  remoteTimer.unref?.();
+}
+
+async function stopRemoteResources() {
+  remoteStopped = true;
+  if (remoteTimer) clearInterval(remoteTimer);
+  remoteTimer = null;
+  const worker = remoteWorker;
+  remoteWorker = null;
+  if (worker) await Promise.resolve(worker.stop());
+  closeAllRemoteDbs();
+}
+
+function readRemoteIndexInfo(id: string) {
+  let sessionCount = 0;
+  let lastIndexedAt = '';
+  try {
+    const handle = dbFor(id);
+    if (handle) {
+      sessionCount = handle.prepare('SELECT COUNT(*) AS c FROM sessions').get()?.c || 0;
+      const marker = handle.prepare("SELECT mtime FROM index_state WHERE jsonl_path = '__last_build__'").get();
+      if (marker?.mtime) lastIndexedAt = new Date(Number(marker.mtime)).toISOString();
+    }
+  } catch {}
+  return { sessionCount, lastIndexedAt };
+}
+
+async function summarizeRemote(remote: RemoteSource, { checkPaths = false } = {}) {
+  const runtime = remoteRuntimeFor(remote.id);
+  const info = readRemoteIndexInfo(remote.id);
+  const roots = await Promise.all((['claude', 'codex', 'pi'] as const).map(async (provider) => {
+    const root = remote.providerRoots[provider] ?? '';
+    const exists = checkPaths && root ? await pathReachable(root) : null;
+    return { provider, path: root, configured: Boolean(root), exists };
+  }));
+  const configured = roots.filter(root => root.configured);
+  let status: string = runtime.state;
+  if (configured.length === 0) status = 'idle';
+  else if (checkPaths) {
+    const reachable = configured.filter(root => root.exists).length;
+    if (reachable === 0) status = 'unreachable';
+    else if (status === 'unreachable' && reachable === configured.length && !runtime.error) status = 'ok';
+  }
+  return {
+    id: remote.id,
+    name: remote.name,
+    providerRoots: remote.providerRoots,
+    roots,
+    dbPath: remoteDbFile(remote.id),
+    sessionCount: info.sessionCount,
+    lastIndexed: info.lastIndexedAt || runtime.lastSuccessAt || '',
+    lastAttempt: runtime.lastAttemptAt || '',
+    status,
+    statusText: status === 'ok' ? 'Accessible'
+      : status === 'indexing' ? 'Indexing…'
+      : status === 'unreachable' ? 'Not found / unreachable'
+      : status === 'error' ? 'Index error'
+      : configured.length === 0 ? 'No directories configured' : 'Waiting for first scan',
+    error: runtime.error || '',
+  };
+}
+
+function listLocations() {
+  const localCount = (() => {
+    try { return db?.prepare('SELECT COUNT(*) AS c FROM sessions').get()?.c || 0; } catch { return 0; }
+  })();
+  return [
+    { id: LOCAL_LOCATION, name: 'Local', kind: 'local', sessionCount: localCount, status: 'ok', statusText: '', error: '' },
+    ...readRemotes(loadPersistedSettings()).map((remote) => {
+      const runtime = remoteRuntimeFor(remote.id);
+      const info = readRemoteIndexInfo(remote.id);
+      return {
+        id: remote.id,
+        name: remote.name,
+        kind: 'remote',
+        sessionCount: info.sessionCount,
+        status: runtime.state,
+        statusText: runtime.state === 'unreachable' ? 'unreachable' : runtime.state === 'indexing' ? 'indexing' : '',
+        error: runtime.error || '',
+      };
+    }),
+  ];
+}
+
+
 function startBackgroundResources({ runStartupBuild = false } = {}) {
   if (!indexerWorker) indexerWorker = createWorkerBuildIndex();
   const paths = getRuntimePaths();
@@ -277,6 +622,7 @@ function startBackgroundResources({ runStartupBuild = false } = {}) {
     const service = startIndexerService({ buildOnStart: false });
     if (runStartupBuild) service.runBuildNow('startup');
   }
+  startRemoteScheduler({ buildOnStart: runStartupBuild });
 }
 
 async function stopIndexerServiceAndWait({ waitForIdle = true } = {}) {
@@ -293,6 +639,7 @@ function stopBackgroundResources({ stopWorker = false } = {}) {
   if (backgroundStopPromise) return backgroundStopPromise;
   backgroundStopPromise = (async () => {
     await stopIndexerServiceAndWait();
+    await stopRemoteResources();
     if (stopWorker && indexerWorker) {
       await Promise.resolve(indexerWorker.stop());
       indexerWorker = null;
@@ -379,9 +726,10 @@ app.on('window-all-closed', () => {
 
 // --- IPC Handlers ---
 
-function querySessionMessages(sessionId: string): SessionMessageRow[] {
-  if (!db) return [];
-  return db.prepare(`
+function querySessionMessages(sessionId: string, location?: unknown): SessionMessageRow[] {
+  const d = dbFor(location);
+  if (!d) return [];
+  return d.prepare(`
     SELECT m.uuid, m.session_id, m.type, m.parent_uuid, m.timestamp, m.role, m.text, m.model,
            m.agent_id, m.input_tokens, m.output_tokens, m.cwd, m.skill, m.turn_duration_ms,
            m.content_type, m.is_meta, m.visibility, m.source
@@ -389,9 +737,10 @@ function querySessionMessages(sessionId: string): SessionMessageRow[] {
   `).all(sessionId) as SessionMessageRow[];
 }
 
-function querySessionToolCalls(sessionId: string): SessionToolCallRow[] {
-  if (!db) return [];
-  return db.prepare(`
+function querySessionToolCalls(sessionId: string, location?: unknown): SessionToolCallRow[] {
+  const d = dbFor(location);
+  if (!d) return [];
+  return d.prepare(`
     SELECT tc.* FROM messages m
     CROSS JOIN tool_calls tc ON tc.message_uuid = m.uuid
     WHERE m.session_id = ? AND m.agent_id IS NULL
@@ -399,9 +748,10 @@ function querySessionToolCalls(sessionId: string): SessionToolCallRow[] {
   `).all(sessionId, sessionId) as SessionToolCallRow[];
 }
 
-function querySessionToolResults(sessionId: string): SessionToolResultRow[] {
-  if (!db) return [];
-  return db.prepare(`
+function querySessionToolResults(sessionId: string, location?: unknown): SessionToolResultRow[] {
+  const d = dbFor(location);
+  if (!d) return [];
+  return d.prepare(`
     SELECT tr.* FROM messages m
     CROSS JOIN tool_results tr ON tr.message_uuid = m.uuid
     WHERE m.session_id = ? AND m.agent_id IS NULL
@@ -409,38 +759,41 @@ function querySessionToolResults(sessionId: string): SessionToolResultRow[] {
   `).all(sessionId, sessionId) as SessionToolResultRow[];
 }
 
-function querySessionSubagents(sessionId: string): SessionSubagentRow[] {
-  if (!db) return [];
-  return db.prepare(`SELECT * FROM subagents WHERE session_id = ?`).all(sessionId) as SessionSubagentRow[];
+function querySessionSubagents(sessionId: string, location?: unknown): SessionSubagentRow[] {
+  const d = dbFor(location);
+  if (!d) return [];
+  return d.prepare(`SELECT * FROM subagents WHERE session_id = ?`).all(sessionId) as SessionSubagentRow[];
 }
 
-function querySessionWorkflows(sessionId: string): SessionWorkflowRow[] {
-  if (!db) return [];
-  const workflows = db.prepare(`SELECT * FROM workflows WHERE session_id = ?`).all(sessionId) as SessionWorkflowRow[];
+function querySessionWorkflows(sessionId: string, location?: unknown): SessionWorkflowRow[] {
+  const d = dbFor(location);
+  if (!d) return [];
+  const workflows = d.prepare(`SELECT * FROM workflows WHERE session_id = ?`).all(sessionId) as SessionWorkflowRow[];
   for (const workflow of workflows) {
-    workflow.agents = db.prepare(`SELECT * FROM workflow_agents WHERE run_id = ?`).all(workflow.run_id) as SessionWorkflowRow['agents'];
+    workflow.agents = d.prepare(`SELECT * FROM workflow_agents WHERE run_id = ?`).all(workflow.run_id) as SessionWorkflowRow['agents'];
   }
   return workflows;
 }
 
-function querySessionSummaries(sessionId: string): SessionSummaryRow[] {
-  if (!db) return [];
-  return db.prepare(`SELECT * FROM summaries WHERE session_id = ? AND agent_id IS NULL AND visibility = 'visible'`).all(sessionId) as SessionSummaryRow[];
+function querySessionSummaries(sessionId: string, location?: unknown): SessionSummaryRow[] {
+  const d = dbFor(location);
+  if (!d) return [];
+  return d.prepare(`SELECT * FROM summaries WHERE session_id = ? AND agent_id IS NULL AND visibility = 'visible'`).all(sessionId) as SessionSummaryRow[];
 }
 
-function querySessionSnapshot(sessionId: string): SessionDetailAssemblyInput {
+function querySessionSnapshot(sessionId: string, location?: unknown): SessionDetailAssemblyInput {
   return {
-    messages: querySessionMessages(sessionId),
-    toolCalls: querySessionToolCalls(sessionId),
-    toolResults: querySessionToolResults(sessionId),
-    subagents: querySessionSubagents(sessionId),
-    workflows: querySessionWorkflows(sessionId),
-    summaries: querySessionSummaries(sessionId),
+    messages: querySessionMessages(sessionId, location),
+    toolCalls: querySessionToolCalls(sessionId, location),
+    toolResults: querySessionToolResults(sessionId, location),
+    subagents: querySessionSubagents(sessionId, location),
+    workflows: querySessionWorkflows(sessionId, location),
+    summaries: querySessionSummaries(sessionId, location),
   };
 }
 
-function querySessionDisplaySnapshot(sessionId: string): SessionPatchSnapshot {
-  const snapshot = querySessionSnapshot(sessionId);
+function querySessionDisplaySnapshot(sessionId: string, location?: unknown): SessionPatchSnapshot {
+  const snapshot = querySessionSnapshot(sessionId, location);
   const detail = assembleSessionDetail(snapshot);
   return {
     messages: detail.messages,
@@ -463,15 +816,17 @@ const SESSION_METADATA_COLUMNS = [
   'source',
 ].join(', ');
 
-function querySessionMetadata(sessionId: string): SessionMetadata | null {
-  if (!db) return null;
+function querySessionMetadata(sessionId: string, location?: unknown): SessionMetadata | null {
+  const d = dbFor(location);
+  if (!d) return null;
   return (
-    db.prepare(`SELECT ${SESSION_METADATA_COLUMNS} FROM sessions WHERE id = ?`).get(sessionId) as SessionMetadata | undefined
+    d.prepare(`SELECT ${SESSION_METADATA_COLUMNS} FROM sessions WHERE id = ?`).get(sessionId) as SessionMetadata | undefined
   ) || null;
 }
 
 ipcMain.handle('db:getSessions', (_, opts = {}) => {
-  if (!db) return [];
+  const d = dbFor(opts.location);
+  if (!d) return [];
   const { project, limit = 200 } = opts;
   if (!Number.isSafeInteger(limit) || limit < 0) {
     throw new TypeError('limit must be a non-negative integer');
@@ -486,44 +841,46 @@ ipcMain.handle('db:getSessions', (_, opts = {}) => {
   if (project) { sql = appendWhere(sql, params, `project LIKE ?`); params.push(project); }
   sql += ` ORDER BY COALESCE(ended_at, started_at) DESC LIMIT ?`;
   params.push(limit);
-  return db.prepare(sql).all(...params);
+  return d.prepare(sql).all(...params);
 });
 
-ipcMain.handle('db:getSessionMessages', (_, sessionId) => {
-  return querySessionMessages(sessionId);
+ipcMain.handle('db:getSessionMessages', (_, sessionId, location) => {
+  return querySessionMessages(sessionId, location);
 });
 
-ipcMain.handle('db:getSessionToolCalls', (_, sessionId) => {
-  return querySessionToolCalls(sessionId);
+ipcMain.handle('db:getSessionToolCalls', (_, sessionId, location) => {
+  return querySessionToolCalls(sessionId, location);
 });
 
-ipcMain.handle('db:getSessionToolResults', (_, sessionId) => {
-  return querySessionToolResults(sessionId);
+ipcMain.handle('db:getSessionToolResults', (_, sessionId, location) => {
+  return querySessionToolResults(sessionId, location);
 });
 
-ipcMain.handle('db:getSessionSubagents', (_, sessionId) => {
-  return querySessionSubagents(sessionId);
+ipcMain.handle('db:getSessionSubagents', (_, sessionId, location) => {
+  return querySessionSubagents(sessionId, location);
 });
 
-ipcMain.handle('db:getSessionWorkflows', (_, sessionId) => {
-  return querySessionWorkflows(sessionId);
+ipcMain.handle('db:getSessionWorkflows', (_, sessionId, location) => {
+  return querySessionWorkflows(sessionId, location);
 });
 
 ipcMain.handle('db:getSessionPatch', (
   _event: IpcMainInvokeEvent,
   sessionId: string,
   cursor: SessionPatchCursor,
+  location?: unknown,
 ) => {
-  if (!db) return null;
+  if (!dbFor(location)) return null;
   return {
-    ...createSessionPatch(querySessionDisplaySnapshot(sessionId), cursor),
-    session: querySessionMetadata(sessionId),
+    ...createSessionPatch(querySessionDisplaySnapshot(sessionId, location), cursor),
+    session: querySessionMetadata(sessionId, location),
   };
 });
 
-ipcMain.handle('db:getSubagentMessages', (_, agentId) => {
-  if (!db) return [];
-  return db.prepare(`
+ipcMain.handle('db:getSubagentMessages', (_, agentId, location) => {
+  const d = dbFor(location);
+  if (!d) return [];
+  return d.prepare(`
     SELECT m.uuid, m.session_id, m.type, m.parent_uuid, m.timestamp, m.role, m.text, m.model,
            m.agent_id, m.input_tokens, m.output_tokens, m.cwd, m.skill, m.turn_duration_ms,
            m.content_type, m.is_meta, m.visibility, m.source
@@ -531,31 +888,34 @@ ipcMain.handle('db:getSubagentMessages', (_, agentId) => {
   `).all(agentId);
 });
 
-ipcMain.handle('db:getSubagentToolCalls', (_, agentId) => {
-  if (!db) return [];
-  return db.prepare(`
+ipcMain.handle('db:getSubagentToolCalls', (_, agentId, location) => {
+  const d = dbFor(location);
+  if (!d) return [];
+  return d.prepare(`
     SELECT tc.* FROM tool_calls tc
     JOIN messages m ON m.uuid = tc.message_uuid
     WHERE m.agent_id = ?
   `).all(agentId);
 });
 
-ipcMain.handle('db:getSubagentToolResults', (_, agentId) => {
-  if (!db) return [];
-  return db.prepare(`
+ipcMain.handle('db:getSubagentToolResults', (_, agentId, location) => {
+  const d = dbFor(location);
+  if (!d) return [];
+  return d.prepare(`
     SELECT tr.* FROM tool_results tr
     JOIN messages m ON m.uuid = tr.message_uuid
     WHERE m.agent_id = ?
   `).all(agentId);
 });
 
-ipcMain.handle('db:getSubagentSummaries', (_, agentId) => {
-  if (!db) return [];
-  return db.prepare(`SELECT * FROM summaries WHERE agent_id = ? AND visibility = 'visible' ORDER BY timestamp, id`).all(agentId);
+ipcMain.handle('db:getSubagentSummaries', (_, agentId, location) => {
+  const d = dbFor(location);
+  if (!d) return [];
+  return d.prepare(`SELECT * FROM summaries WHERE agent_id = ? AND visibility = 'visible' ORDER BY timestamp, id`).all(agentId);
 });
 
-ipcMain.handle('db:getSessionSummaries', (_, sessionId) => {
-  return querySessionSummaries(sessionId);
+ipcMain.handle('db:getSessionSummaries', (_, sessionId, location) => {
+  return querySessionSummaries(sessionId, location);
 });
 
 ipcMain.handle('db:getMemories', () => {
@@ -566,19 +926,19 @@ ipcMain.handle('db:getMemories', () => {
   `).all();
 });
 
-ipcMain.handle('db:getMessageFullText', (_, uuid) => {
-  if (!db) return null;
-  const msg = db.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
+ipcMain.handle('db:getMessageFullText', (_, uuid, location) => {
+  const d = dbFor(location);
+  if (!d) return null;
+  const msg = d.prepare('SELECT * FROM messages WHERE uuid=?').get(uuid);
   if (!msg) return null;
-  const session = db.prepare('SELECT * FROM sessions WHERE id=?').get(msg.session_id) ?? null;
+  const session = d.prepare('SELECT * FROM sessions WHERE id=?').get(msg.session_id) ?? null;
   const subagent = msg.agent_id
-    ? db.prepare('SELECT * FROM subagents WHERE agent_id=?').get(msg.agent_id) ?? null
+    ? d.prepare('SELECT * FROM subagents WHERE agent_id=?').get(msg.agent_id) ?? null
     : null;
   const workflowAgent = msg.agent_id
-    ? db.prepare('SELECT * FROM workflow_agents WHERE agent_id=?').get(msg.agent_id) ?? null
+    ? d.prepare('SELECT * FROM workflow_agents WHERE agent_id=?').get(msg.agent_id) ?? null
     : null;
-  const paths = getRuntimePaths();
-  const raw = paths.providerRegistry.raw({
+  const raw = registryForLocation(location).raw({
     source: msg.source || session?.source || 'claude',
     messageUuid: String(uuid),
     session,
@@ -642,10 +1002,11 @@ ipcMain.handle('db:restoreMemory', (_, id) => {
 });
 
 ipcMain.handle('db:getProjects', (_, opts = {}) => {
-  if (!db) return [];
+  const d = dbFor(opts.location);
+  if (!d) return [];
   const sourceFilter = sourceWhereClause(opts);
   const where = sourceFilter.sql ? `WHERE ${sourceFilter.sql}` : '';
-  return db.prepare(`
+  return d.prepare(`
     SELECT project, project_path, COUNT(*) as session_count,
            MAX(COALESCE(ended_at, started_at)) as last_active
     FROM sessions ${where ? `${where} AND` : 'WHERE'} project IS NOT NULL
@@ -654,21 +1015,23 @@ ipcMain.handle('db:getProjects', (_, opts = {}) => {
 });
 
 ipcMain.handle('db:getStats', (_, opts = {}) => {
-  if (!db) return { sessions: 0, memories: 0, memoriesArchived: 0 };
+  const d = dbFor(opts.location);
+  if (!d) return { sessions: 0, memories: 0, memoriesArchived: 0 };
   const sourceFilter = sourceWhereClause(opts);
   const where = sourceFilter.sql ? `WHERE ${sourceFilter.sql}` : '';
-  const sessions = db.prepare(`SELECT COUNT(*) as c FROM sessions ${where}`).get(...sourceFilter.params)?.c || 0;
-  const memories = db.prepare('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NULL').get()?.c || 0;
-  const memoriesArchived = db.prepare('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NOT NULL').get()?.c || 0;
+  const sessions = d.prepare(`SELECT COUNT(*) as c FROM sessions ${where}`).get(...sourceFilter.params)?.c || 0;
+  const memories = d.prepare('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NULL').get()?.c || 0;
+  const memoriesArchived = d.prepare('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NOT NULL').get()?.c || 0;
   return { sessions, memories, memoriesArchived };
 });
 
 ipcMain.handle('db:getUsageStats', (_, opts = {}) => {
-  if (!db) return { daily: [], totalTokens: 0, peakDay: null, longestTurn: null };
+  const d = dbFor(opts.location);
+  if (!d) return { daily: [], totalTokens: 0, peakDay: null, longestTurn: null };
   const messageFilter = sourceWhereClause(opts, 'm.source');
   const summaryFilter = sourceWhereClause(opts, 's.source');
 
-  const usageDays = db.prepare(`
+  const usageDays = d.prepare(`
     WITH usage_events AS (
       SELECT m.timestamp, m.input_tokens, m.output_tokens
       FROM messages m
@@ -694,7 +1057,7 @@ ipcMain.handle('db:getUsageStats', (_, opts = {}) => {
     null,
   );
 
-  const longestTurn = db.prepare(`
+  const longestTurn = d.prepare(`
     SELECT turn_duration_ms, uuid, session_id, timestamp
     FROM messages m
     WHERE m.turn_duration_ms IS NOT NULL
@@ -724,7 +1087,7 @@ function savePersistedSettings(settings) {
   fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2));
 }
 
-ipcMain.handle('settings:get', () => {
+ipcMain.handle('settings:get', async () => {
   const persisted = loadPersistedSettings();
   const paths = getRuntimePaths(persisted);
   const { providerRoots, providerRegistry, claudeDir, codexDir, dbPath: dbFile } = paths;
@@ -758,8 +1121,10 @@ ipcMain.handle('settings:get', () => {
   const sessionCount = sources.reduce((sum, source) => sum + source.sessionCount, 0);
   const lastIndexed = sources.map((source) => source.lastIndexed).filter(Boolean).sort().at(-1) || '';
   const connected = sources.some((source) => source.status !== 'error');
+  const remotes = await Promise.all(readRemotes(persisted).map((remote) => summarizeRemote(remote, { checkPaths: true })));
 
   return {
+    remotes,
     version: app.getVersion(),
     providerRoots,
     claudeDir,
@@ -776,6 +1141,8 @@ ipcMain.handle('settings:get', () => {
 });
 
 ipcMain.handle('settings:set', async (_, key, value) => {
+  // Remotes are managed only through the remotes:* handlers (ids, DB files).
+  if (typeof key === 'string' && (key === 'remotes' || key.startsWith('remotes.'))) return false;
   const persisted = loadPersistedSettings();
   const providerRootChanged = setPersistedSetting(persisted, key, value);
   savePersistedSettings(persisted);
@@ -801,6 +1168,76 @@ ipcMain.handle('settings:set', async (_, key, value) => {
     notifyIndexUpdated();
   }
   return true;
+});
+
+// --- Remote location IPC ---
+
+ipcMain.handle('locations:list', () => listLocations());
+
+ipcMain.handle('remotes:add', async (_, input = {}) => {
+  const persisted = loadPersistedSettings();
+  const remote = addRemote(persisted, input);
+  savePersistedSettings(persisted);
+  notifyRemotesUpdated();
+  void refreshRemote(remote.id, { reason: 'remote-added' }).catch(() => {});
+  return remote;
+});
+
+ipcMain.handle('remotes:update', async (_, id, patch = {}) => {
+  if (!isRemoteId(id)) return null;
+  const persisted = loadPersistedSettings();
+  const updated = updateRemote(persisted, id, patch);
+  if (!updated) return null;
+  savePersistedSettings(persisted);
+  notifyRemotesUpdated();
+  // Changed directories invalidate what was indexed: rebuild into a temp DB and
+  // swap only on success (an unreachable share leaves the old index in place).
+  if (updated.rootsChanged) void refreshRemote(id, { force: true, reason: 'remote-roots-changed' }).catch(() => {});
+  return updated.remote;
+});
+
+ipcMain.handle('remotes:remove', async (_, id) => {
+  if (!isRemoteId(id)) return false;
+  const persisted = loadPersistedSettings();
+  if (!removeRemote(persisted, id)) return false;
+  savePersistedSettings(persisted);
+  remoteRuntime.delete(id);
+  await enqueueRemote(async () => removeRemoteDbFiles(id));
+  notifyRemotesUpdated();
+  notifyIndexUpdated({}, id);
+  return true;
+});
+
+ipcMain.handle('remotes:refresh', async (_, id) => {
+  if (!isRemoteId(id) || !findRemote(id)) return null;
+  const result = await refreshRemote(id, { reason: 'remote-manual-refresh' });
+  return result ? { files: result.files ?? 0, deferred: Boolean(result.deferred) } : null;
+});
+
+ipcMain.handle('remotes:rebuild', async (_, id) => {
+  if (!isRemoteId(id) || !findRemote(id)) return null;
+  const result = await refreshRemote(id, { force: true, reason: 'remote-manual-rebuild' });
+  return result ? { files: result.files ?? 0, deferred: Boolean(result.deferred) } : null;
+});
+
+/** "Pick remote home directory": choose <home>, auto-fill the roots that exist. */
+ipcMain.handle('remotes:pickHome', async (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return null;
+  const { filePaths } = await dialog.showOpenDialog(win, {
+    properties: ['openDirectory'],
+    title: 'Select the remote home directory (contains .claude / .codex / .pi)',
+  });
+  const home = filePaths?.[0];
+  if (!home) return null;
+  const exists = new Map<string, boolean>();
+  const candidates = [
+    path.join(home, '.claude'),
+    path.join(home, '.codex'),
+    path.join(home, '.pi', 'agent', 'sessions'),
+  ];
+  await Promise.all(candidates.map(async (c) => exists.set(c, await pathReachable(c))));
+  return { home, providerRoots: detectRemoteHomeRoots(home, (c) => exists.get(c) === true) };
 });
 
 ipcMain.handle('settings:browseFolder', async (event) => {

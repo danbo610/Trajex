@@ -15,7 +15,7 @@ import {
   refreshSessionProjectPaths,
 } from '../../../packages/core/src/index-finalize.ts';
 import { healWorkflowParentLinks } from '../../../packages/core/src/indexer.ts';
-import type { ProviderRegistry } from '../../../packages/core/src/providers/registry.ts';
+import { createProviderRegistry, type ProviderRegistry } from '../../../packages/core/src/providers/registry.ts';
 import {
   assertRebuildRootsAvailable,
   createProviderIndexPlan,
@@ -163,6 +163,8 @@ function writeHeartbeat({
 interface BuildIndexOptions {
   providerRoots?: Record<string, string>;
   providerRegistry?: ProviderRegistry;
+  /** Restrict indexing to these provider ids (remote locations only index what is configured). */
+  enabledProviders?: string[];
   claudeDir?: string;
   codexDir?: string;
   projectsDir?: string;
@@ -219,6 +221,7 @@ function deferredBuildResult(
 function buildIndex({
   providerRoots = {},
   providerRegistry,
+  enabledProviders,
   claudeDir = DEFAULT_CLAUDE_DIR,
   codexDir = path.join(path.dirname(claudeDir), '.codex'),
   projectsDir = path.join(claudeDir, 'projects'),
@@ -276,7 +279,10 @@ function buildIndex({
         codex: codexDir,
         ...providerRoots,
       };
-      const registry = providerRegistry ?? createBuiltinProviderRegistry(roots);
+      const fullRegistry = providerRegistry ?? createBuiltinProviderRegistry(roots);
+      const registry = enabledProviders
+        ? createProviderRegistry(fullRegistry.list().filter((provider) => enabledProviders.includes(provider.name)))
+        : fullRegistry;
       let priorSessions;
       if (force && preserveDbPath && path.resolve(preserveDbPath) !== path.resolve(dbPath)) {
         const previousDb = new DatabaseImpl(preserveDbPath);

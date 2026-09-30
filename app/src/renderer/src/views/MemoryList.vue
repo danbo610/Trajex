@@ -90,9 +90,9 @@ function sourceSessionTitle(m) {
 function openSourceSession(m) {
   if (!m.session_id) return;
   if (m.message_start) {
-    router.push({ path: `/sessions/${m.session_id}`, query: { focus: m.message_start } });
+    router.push({ path: `/l/local/sessions/${encodeURIComponent(m.session_id)}`, query: { focus: m.message_start } });
   } else {
-    router.push(`/sessions/${m.session_id}`);
+    router.push(`/l/local/sessions/${encodeURIComponent(m.session_id)}`);
   }
 }
 

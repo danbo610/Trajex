@@ -120,10 +120,10 @@ test('live patch state advances only after the visible snapshot commit is accept
   const commitLiveSnapshot = sessionDetail.match(/async function commitLiveSnapshot\(snapshot\) \{([\s\S]*?)\n\}/)?.[1] || '';
 
   assert.doesNotMatch(loadLiveSnapshot, /clearSessionDirty|acceptMessagePatch/);
-  assert.match(loadLiveSnapshot, /fetchSessionDetailPatch\(sessionId\)/);
+  assert.match(loadLiveSnapshot, /fetchSessionDetailPatch\(sessionId(?:,\s*location)?\)/);
   assert.match(
     commitLiveSnapshot,
     /materializeSessionDetailPatch\(snapshot\.patchRequest\);[\s\S]*await commitSessionSnapshot\(latest\);[\s\S]*acceptMessagePatch[\s\S]*clearSessionDirty/,
   );
-  assert.match(commitLiveSnapshot, /markSessionDirty\(snapshot\.sessionId\)/);
+  assert.match(commitLiveSnapshot, /markSessionDirty\((?:liveSessionKey\(location,\s*)?snapshot\.sessionId\)?\)/);
 });

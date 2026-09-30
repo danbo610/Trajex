@@ -13,6 +13,9 @@ import {
   setView,
   setProject,
   clearSelection,
+  locationPath,
+  isRemoteLocation,
+  locationName,
   setQuery,
   setProjectSearch,
   toggleSort,
@@ -97,16 +100,17 @@ const windowTitle = computed(() => {
   const appName = 'Trajex';
   let scopeText = '';
   if (route.name === 'Activity') {
-    scopeText = 'Activity';
+    scopeText = isRemoteLocation() ? `${locationName()} · Activity` : 'Activity';
   } else if (route.name === 'Settings') {
     scopeText = 'Settings';
   } else if (route.name?.startsWith('Session')) {
+    const where = isRemoteLocation() ? `${locationName()} · ` : '';
     if (route.name === 'SessionDetail' || route.name === 'SubagentDetail') {
       const s = routeSession.value;
-      scopeText = s ? `Sessions · ${s.title}` : 'Sessions';
+      scopeText = s ? `${where}Sessions · ${s.title}` : `${where}Sessions`;
     } else {
       const proj = state.projectFilter !== 'all' ? ` · ${formatProjectLabel(state.projectFilter)}` : '';
-      scopeText = `Sessions${proj}`;
+      scopeText = `${where}Sessions${proj}`;
     }
   } else {
     if (route.name === 'MemoryDetail') {
@@ -131,12 +135,27 @@ function handleSidebarRoute(routeName) {
   clearTimeout(searchTimer);
   resetListState();
   if (routeName === 'sessions') {
-    router.push('/sessions');
+    router.push(locationPath(state.location, 'sessions'));
   } else if (routeName === 'activity') {
-    router.push('/activity');
+    router.push(locationPath(state.location, 'activity'));
   } else {
     router.push('/memory');
   }
+}
+
+// Location layer: Local, Remote A, Remote B ... Keeps sessions/activity context.
+function handleSelectLocation(id) {
+  clearTimeout(searchTimer);
+  resetListState();
+  const section = currentRouteType.value === 'activity' ? 'activity' : 'sessions';
+  router.push(locationPath(id, section));
+}
+
+function locationHint(loc) {
+  if (loc.status === 'unreachable') return 'unreachable — showing last index';
+  if (loc.status === 'indexing') return 'indexing…';
+  if (loc.status === 'error') return loc.error || 'index error';
+  return '';
 }
 
 function handleSidebarView(view) {
@@ -150,7 +169,7 @@ function handleClearProject() {
 
 function handleSidebarProject(slug) {
   setProject(slug);
-  if (currentRouteType.value === 'sessions') router.push('/sessions');
+  if (currentRouteType.value === 'sessions') router.push(locationPath(state.location, 'sessions'));
   else router.push('/memory');
 }
 
@@ -256,6 +275,28 @@ function setSourceFilter(id) {
           <button class="theme-toggle" type="button" :aria-label="theme === 'dark' ? '切换到白天模式' : '切换到黑夜模式'" :title="theme === 'dark' ? '切换到白天模式' : '切换到黑夜模式'" @click="toggleTheme">
             <svg v-if="theme === 'dark'" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M12.6 3.4l-1.4 1.4M4.8 11.2l-1.4 1.4" stroke-linecap="round"/></svg>
             <svg v-else viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M13.8 10.1A5.8 5.8 0 0 1 5.9 2.2a5.8 5.8 0 1 0 7.9 7.9Z" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+
+        <div class="sidebar-section" v-if="state.locations.length > 1">
+          <div class="sidebar-section-title"><span>Location</span></div>
+          <button
+            v-for="loc in state.locations" :key="loc.id"
+            class="sidebar-item"
+            :class="{ active: state.location === loc.id && currentRouteType !== 'memory' && currentRouteType !== 'settings' }"
+            :title="locationHint(loc)"
+            @click="handleSelectLocation(loc.id)"
+          >
+            <svg v-if="loc.kind === 'local'" class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round">
+              <rect x="2" y="3" width="12" height="8" rx="1.2"/><path d="M5.5 13.5h5M8 11v2.5"/>
+            </svg>
+            <svg v-else class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round">
+              <rect x="2" y="2.5" width="12" height="4.5" rx="1"/><rect x="2" y="9" width="12" height="4.5" rx="1"/><path d="M4.5 4.75h.01M4.5 11.25h.01"/>
+            </svg>
+            <span class="label">{{ loc.name }}</span>
+            <span v-if="loc.status === 'unreachable' || loc.status === 'error'" class="badge" style="color:#f87171;">!</span>
+            <span v-else-if="loc.status === 'indexing'" class="badge">…</span>
+            <span v-else class="badge">{{ loc.id === state.location ? sessionCount : loc.sessionCount }}</span>
           </button>
         </div>
 
@@ -424,12 +465,12 @@ function setSourceFilter(id) {
               </template>
             </template>
             <template v-else>
-              <router-link class="crumb" to="/sessions" v-if="route.name === 'SessionDetail' || route.name === 'SubagentDetail'">
-                Sessions
+              <router-link class="crumb" :to="locationPath(state.location, 'sessions')" v-if="route.name === 'SessionDetail' || route.name === 'SubagentDetail'">
+                <template v-if="isRemoteLocation()">{{ locationName() }} · </template>Sessions
               </router-link>
               <template v-if="route.name === 'SubagentDetail'">
                 <span class="crumb-sep">/</span>
-                <router-link class="crumb" :to="`/sessions/${route.params.id}`">
+                <router-link class="crumb" :to="`${locationPath(state.location, 'sessions')}/${encodeURIComponent(route.params.id)}`">
                   {{ (routeSession?.title || '').slice(0, 30) || route.params.id }}
                 </router-link>
               </template>
@@ -522,7 +563,7 @@ function setSourceFilter(id) {
         <router-view v-slot="{ Component }">
           <component
             :is="Component"
-            :key="route.name === 'SessionDetail' ? `session:${route.params.id}` : undefined"
+            :key="route.name === 'SessionDetail' ? `session:${route.params.loc || 'local'}:${route.params.id}` : undefined"
           />
         </router-view>
       </main>

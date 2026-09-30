@@ -11,9 +11,11 @@ import { createSessionDisclosureState } from '../session-disclosures.mjs';
 import SessionTimelineRow from '../components/SessionTimelineRow.vue';
 
 defineOptions({ name: 'SubagentDetail' });
-const props = defineProps({ id: String, agentId: String });
+const props = defineProps({ id: String, agentId: String, loc: String });
 const router = useRouter();
 const route = useRoute();
+const location = String(route.params.loc || 'local');
+const isRemote = location !== 'local';
 
 const messages = ref([]);
 const summaries = ref([]);
@@ -40,7 +42,7 @@ async function load(requestRevision, agentId) {
   if (!agentId) return;
   loading.value = true;
   try {
-    const detail = await loadSubagentDetail(agentId);
+    const detail = await loadSubagentDetail(agentId, location);
     if (revision !== requestRevision || props.agentId !== agentId) return;
     messages.value = detail.messages;
     summaries.value = detail.summaries;
@@ -53,7 +55,7 @@ async function load(requestRevision, agentId) {
 async function handleLoadFull(uuid) {
   const requestRevision = revision;
   const agentId = props.agentId;
-  const full = await loadFullText(uuid);
+  const full = await loadFullText(uuid, location);
   if (!full || revision !== requestRevision || props.agentId !== agentId) return;
   if (!messages.value.some(message => message.uuid === uuid)) return;
   expandedMessageText.set(uuid, full);
@@ -72,13 +74,13 @@ async function handleLoadFullText(uuid) {
 function navigateToSubagent(agentId) {
   router.push({
     name: 'SubagentDetail',
-    params: { id: props.id || route.params.id, agentId },
+    params: { loc: location, id: props.id || route.params.id, agentId },
   });
 }
 </script>
 
 <template>
-  <div class="session-detail-wrap" ref="wrapRef">
+  <div class="session-detail-wrap" ref="wrapRef" :data-remote-session="isRemote ? 'true' : null">
     <div class="detail-wide">
       <div class="session-header">
         <div class="session-eyebrow">

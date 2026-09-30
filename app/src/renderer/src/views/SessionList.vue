@@ -5,7 +5,7 @@
 <script setup>
 import { computed, ref, onMounted, onUnmounted } from 'vue';
 import { useRouter } from 'vue-router';
-import { state } from '../store.js';
+import { state, isRemoteLocation, locationName } from '../store.js';
 import { highlightPlain, escapeHTML, formatProjectLabel, fmtListTime, fmtRelative } from '../utils.js';
 
 defineOptions({ name: 'SessionList' });
@@ -78,7 +78,7 @@ function createdLabel(session) {
 }
 
 function openSession(session) {
-  router.push({ name: 'SessionDetail', params: { id: session.id } });
+  router.push({ name: 'SessionDetail', params: { loc: state.location, id: session.id } });
 }
 
 function trajexStyle(session) {
@@ -105,8 +105,22 @@ function trajexStyle(session) {
 
 <template>
   <div class="session-list-wrap">
+    <!-- Remote location without sessions yet -->
+    <div v-if="state.loaded && isRemoteLocation() && !visibleSessions.length && !state.query" class="empty-content">
+      <div class="empty-eyebrow">
+        <span class="diamond"></span>
+        <span>{{ locationName() }}</span>
+      </div>
+      <div class="empty-title">No sessions indexed for this remote yet.</div>
+      <div class="empty-body">
+        Trajex reads the remote's directories (read-only) every 5 minutes into a separate local index.
+        Check the directories under <button class="inline-link" @click="router.push('/settings')">Settings → Data Sources → Remote</button>
+        and make sure the share is mounted.
+      </div>
+    </div>
+
     <!-- Empty state: no data source / debug toggle -->
-    <div v-if="state.loaded && (debugEmpty || (!visibleSessions.length && !state.query))" class="empty-content">
+    <div v-else-if="state.loaded && (debugEmpty || (!visibleSessions.length && !state.query))" class="empty-content">
       <div class="empty-eyebrow">
         <span class="diamond"></span>
         <span>No data source connected</span>

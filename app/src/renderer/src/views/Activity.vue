@@ -3,7 +3,7 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue';
+import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { state } from '../store.js';
 import { fmtTokens, fmtDuration, fmtTooltipDate, positionTooltip, escapeHTML, formatProjectLabel } from '../utils.js';
@@ -327,7 +327,7 @@ function updateTooltipPos(event) {
 }
 
 function goToSession(sessionId) {
-  router.push({ name: 'SessionDetail', params: { id: sessionId } });
+  router.push({ name: 'SessionDetail', params: { loc: state.location, id: sessionId } });
 }
 
 function buildMonthBlock(year, month) {
@@ -368,7 +368,9 @@ function showNextMonth() {
 
 async function loadUsageStats() {
   try {
-    const data = await window.trajex.getUsageStats({ source: 'all' });
+    const location = state.location;
+    const data = await window.trajex.getUsageStats({ source: 'all', location });
+    if (location !== state.location) return;
     usageData.daily = data.daily || [];
     usageData.totalTokens = data.totalTokens || 0;
     usageData.peakDay = data.peakDay || null;
@@ -382,12 +384,22 @@ async function loadUsageStats() {
 let stopUsageUpdates = () => {};
 
 onMounted(async () => {
+  // loadUsageStats() reads state.location and drops stale replies, so an update
+  // for another location just causes a harmless re-read of the current one.
   stopUsageUpdates = window.trajex?.onIndexUpdated?.(() => {
     void loadUsageStats();
   }) || (() => {});
   await loadUsageStats();
   loading.value = false;
   showNextMonth();
+});
+
+watch(() => state.location, () => {
+  usageData.daily = [];
+  usageData.totalTokens = 0;
+  usageData.peakDay = null;
+  usageData.longestTurn = null;
+  void loadUsageStats();
 });
 
 onUnmounted(() => stopUsageUpdates());

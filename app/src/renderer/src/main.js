@@ -7,8 +7,9 @@
 import { createApp } from 'vue';
 import App from './App.vue';
 import router from './router.js';
-import { commitInitialData, fetchInitialData } from './data.js';
-import { noteSessionUpdated, sessionLiveState } from './session-live.mjs';
+import { commitInitialData, fetchInitialData, loadLocations } from './data.js';
+import { state } from './store.js';
+import { liveSessionKey, noteSessionUpdated, sessionLiveState } from './session-live.mjs';
 import { createGlobalDataRefreshCoordinator } from './session-global-refresh.mjs';
 import { installLocalMarkdownLinkHandlers } from './local-markdown-links.js';
 
@@ -40,10 +41,20 @@ function reportGlobalRefreshFailure(request) {
 
 // Load data on startup
 router.isReady().then(() => {
+  loadedLocation = state.location;
+  void loadLocations();
   reportGlobalRefreshFailure(globalDataRefresh.initialize());
 });
 
+// The catalogue in the store belongs to one location; reload after switching.
+let loadedLocation = null;
 router.afterEach(() => {
+  if (loadedLocation !== null && loadedLocation !== state.location) {
+    loadedLocation = state.location;
+    reportGlobalRefreshFailure(globalDataRefresh.invalidate());
+    return;
+  }
+  loadedLocation = state.location;
   reportGlobalRefreshFailure(globalDataRefresh.flush());
 });
 
@@ -54,14 +65,24 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
-window.trajex?.onIndexUpdated?.(() => {
+window.trajex?.onIndexUpdated?.((payload) => {
+  const location = payload?.location;
+  void loadLocations();
+  // Other remotes' index changes do not affect what is on screen.
+  if (location && location !== 'local' && location !== state.location) return;
   reportGlobalRefreshFailure(globalDataRefresh.invalidate());
 });
 
-window.trajex?.onSessionUpdated?.(({ sessionId } = {}) => {
+window.trajex?.onRemotesUpdated?.(() => {
+  void loadLocations();
+});
+
+window.trajex?.onSessionUpdated?.(({ sessionId, location } = {}) => {
   const route = router.currentRoute.value;
-  const currentSessionId = route.name === 'SessionDetail' ? String(route.params.id || '') : null;
-  noteSessionUpdated(sessionLiveState, sessionId, currentSessionId);
+  const currentSessionId = route.name === 'SessionDetail'
+    ? liveSessionKey(String(route.params.loc || 'local'), String(route.params.id || ''))
+    : null;
+  noteSessionUpdated(sessionLiveState, liveSessionKey(location, sessionId), currentSessionId);
 });
 
 installLocalMarkdownLinkHandlers();

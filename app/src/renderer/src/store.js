@@ -23,8 +23,45 @@ export const state = reactive({
   includeMessageBodies: false,
   cursorId: null,
   selection: markRaw(new Set()),
-  loaded: false
+  loaded: false,
+  // Active data location: 'local' or a remote id. Sessions/projects/stats in
+  // this store always belong to this location; memories are always local.
+  location: 'local',
+  locations: [{ id: 'local', name: 'Local', kind: 'local', sessionCount: 0, status: 'ok', statusText: '', error: '' }],
 });
+
+export const LOCAL_LOCATION = 'local';
+
+export function isRemoteLocation(id = state.location) {
+  return Boolean(id) && id !== LOCAL_LOCATION;
+}
+
+export function locationName(id = state.location) {
+  return state.locations.find(item => item.id === id)?.name || (id === LOCAL_LOCATION ? 'Local' : id);
+}
+
+/** Switch the active location and drop the previous location's catalogue. */
+export function setLocation(id) {
+  const next = id || LOCAL_LOCATION;
+  if (state.location === next) return false;
+  state.location = next;
+  state.sessions = [];
+  state.projects = [];
+  state.stats = {};
+  state.loaded = false;
+  state.projectFilter = 'all';
+  state.sourceFilter = 'all';
+  state.query = '';
+  state.cursorId = null;
+  state.selection = markRaw(new Set());
+  state.sessionTitleOverrides.clear();
+  return true;
+}
+
+/** Route path helpers (every session/stat route carries its location). */
+export function locationPath(id, section = 'sessions') {
+  return `/l/${encodeURIComponent(id || LOCAL_LOCATION)}/${section}`;
+}
 
 export function getSessionSummary(sessionId) {
   const id = String(sessionId || '');
