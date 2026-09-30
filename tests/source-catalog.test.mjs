@@ -18,3 +18,15 @@ test('renderer source presentation comes from the runtime provider catalog', () 
   assert.equal(sourceLabel('future-provider', catalog), 'Future Provider');
   assert.equal(sourceColor('future-provider', catalog), '#8b8b93');
 });
+
+test('built-in agents keep their characteristic label and color before the catalog loads', () => {
+  assert.equal(sourceLabel('claude', []), 'Claude Code');
+  assert.equal(sourceLabel(undefined, []), 'Claude Code');
+  assert.equal(sourceLabel('codex', []), 'Codex');
+  assert.equal(sourceLabel('pi', []), 'Pi');
+  assert.equal(sourceColor('claude', []), '#d97757');
+  assert.equal(sourceColor('codex', []), '#10a37f');
+  assert.equal(sourceColor('pi', []), '#7c3aed');
+  // The runtime catalog still wins.
+  assert.equal(sourceColor('codex', [{ id: 'codex', name: 'Codex', color: '#000001' }]), '#000001');
+});

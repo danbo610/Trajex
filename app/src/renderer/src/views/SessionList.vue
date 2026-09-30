@@ -6,6 +6,7 @@
 import { computed, ref, onMounted, onUnmounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { state, isRemoteLocation, locationName } from '../store.js';
+import { sourceColor, sourceLabel } from '../source-catalog.mjs';
 import { highlightPlain, escapeHTML, formatProjectLabel, fmtListTime, fmtRelative } from '../utils.js';
 
 defineOptions({ name: 'SessionList' });
@@ -180,7 +181,12 @@ function trajexStyle(session) {
             <span>{{ s.message_count || 0 }} msg</span>
           </div>
         </div>
-        <div class="srow-right">{{ timeLabel(s) }}</div>
+        <div class="srow-right">
+          <span class="srow-time">{{ timeLabel(s) }}</span>
+          <span class="srow-agent" :title="sourceLabel(s.source, state.sources)">
+            <span class="srow-agent-dot" :style="{ '--source-color': sourceColor(s.source, state.sources) }"></span>{{ sourceLabel(s.source, state.sources) }}
+          </span>
+        </div>
       </div>
 
       <!-- Noise fold banner -->
@@ -215,7 +221,12 @@ function trajexStyle(session) {
               <span>{{ s.message_count || 0 }} msg</span>
             </div>
           </div>
-          <div class="srow-right">{{ timeLabel(s) }}</div>
+          <div class="srow-right">
+          <span class="srow-time">{{ timeLabel(s) }}</span>
+          <span class="srow-agent" :title="sourceLabel(s.source, state.sources)">
+            <span class="srow-agent-dot" :style="{ '--source-color': sourceColor(s.source, state.sources) }"></span>{{ sourceLabel(s.source, state.sources) }}
+          </span>
+        </div>
         </div>
         <button class="noise-fold-bottom" @click.stop="showNoise = false">
           <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
@@ -318,7 +329,30 @@ function trajexStyle(session) {
   flex-shrink: 0;
   padding-top: 2px;
   white-space: nowrap;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
 }
+.srow-agent {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  line-height: 1.2;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+  text-transform: lowercase;
+}
+.srow-agent-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--source-color);
+  box-shadow: 0 0 4px color-mix(in srgb, var(--source-color) 60%, transparent);
+}
+[data-theme='light'] .srow-agent-dot { box-shadow: none; }
 
 .empty {
   flex: 1;

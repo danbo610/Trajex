@@ -4,6 +4,14 @@
 
 const FALLBACK_COLOR = '#8b8b93';
 
+// Used until the runtime provider catalog (settings:get) has loaded; same values as the
+// built-in provider descriptors, so list rows never flash grey / a bare id.
+const BUILTIN_PRESENTATION = {
+  claude: { name: 'Claude Code', color: '#d97757' },
+  codex: { name: 'Codex', color: '#10a37f' },
+  pi: { name: 'Pi', color: '#7c3aed' },
+};
+
 function sourceId(value) {
   const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
   return normalized || 'claude';
@@ -24,9 +32,9 @@ function titleCaseId(id) {
 
 export function sourceLabel(source, catalog = []) {
   const id = sourceId(source);
-  return descriptorFor(id, catalog)?.name || titleCaseId(id);
+  return descriptorFor(id, catalog)?.name || BUILTIN_PRESENTATION[id]?.name || titleCaseId(id);
 }
 
 export function sourceColor(source, catalog = []) {
-  return descriptorFor(source, catalog)?.color || FALLBACK_COLOR;
+  return descriptorFor(source, catalog)?.color || BUILTIN_PRESENTATION[sourceId(source)]?.color || FALLBACK_COLOR;
 }
