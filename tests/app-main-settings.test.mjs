@@ -506,6 +506,11 @@ test('session IPC hides Codex rows by default and supports explicit source opt-i
 
     const settings = await ipcHandlers.get('settings:get')();
     assert.equal(settings.version, '0.2.0');
+    assert.equal(settings.showUntitledSessions, false);
+    await ipcHandlers.get('settings:set')(null, 'showUntitledSessions', true);
+    assert.equal((await ipcHandlers.get('settings:get')()).showUntitledSessions, true);
+    await ipcHandlers.get('settings:set')(null, 'showUntitledSessions', false);
+    assert.equal((await ipcHandlers.get('settings:get')()).showUntitledSessions, false);
     assert.ok(
       queries.some(q => /GROUP BY COALESCE\(source, 'claude'\)/.test(q.sql)),
     );

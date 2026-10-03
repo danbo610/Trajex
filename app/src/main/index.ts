@@ -1259,6 +1259,7 @@ ipcMain.handle('settings:get', async () => {
     codexDir,
     dbPath: dbFile,
     autoRefresh: persisted.autoRefresh !== false,
+    showUntitledSessions: persisted.showUntitledSessions === true,
     debugLogging: persisted.debugLogging === true,
     debugLoggingForced: isDebugLoggingEnabled({}),
     debugLogPath: remoteLog.filePath,

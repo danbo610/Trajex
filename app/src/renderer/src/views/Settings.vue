@@ -12,6 +12,7 @@ defineOptions({ name: 'Settings' });
 const sources = ref([]);
 const dbPath = ref('');
 const autoRefresh = ref(true);
+const showUntitled = ref(false);
 const debugLogging = ref(false);
 const debugLoggingForced = ref(false);
 const debugLogPath = ref('');
@@ -78,6 +79,8 @@ async function loadSettings() {
   sources.value = s.sources || [];
   dbPath.value = s.dbPath || '';
   autoRefresh.value = s.autoRefresh !== false;
+  showUntitled.value = s.showUntitledSessions === true;
+  state.showUntitledSessions = showUntitled.value;
   debugLogging.value = s.debugLogging === true;
   debugLoggingForced.value = s.debugLoggingForced === true;
   debugLogPath.value = s.debugLogPath || '';
@@ -178,6 +181,13 @@ async function browseSourcePath(source) {
 async function toggleAutoRefresh() {
   autoRefresh.value = !autoRefresh.value;
   await saveSetting('autoRefresh', autoRefresh.value);
+}
+
+async function toggleShowUntitled() {
+  showUntitled.value = !showUntitled.value;
+  // Update the shared store first so an open Sessions list re-renders immediately.
+  state.showUntitledSessions = showUntitled.value;
+  await saveSetting('showUntitledSessions', showUntitled.value);
 }
 
 async function toggleDebugLogging() {
@@ -402,6 +412,24 @@ function fmtRelative(iso) {
           </span>
           <span class="toggle-text">Watch data sources for changes</span>
         </label>
+      </section>
+
+      <!-- Sessions list -->
+      <section class="settings-section">
+        <div class="settings-section-head">
+          <h2>Sessions list</h2>
+          <p>How sessions are listed for every location (Local and remotes).</p>
+        </div>
+        <label class="toggle-label" @click.prevent="toggleShowUntitled">
+          <span class="toggle-track" :class="{ on: showUntitled }">
+            <span class="toggle-thumb"></span>
+          </span>
+          <span class="toggle-text">Show untitled sessions</span>
+        </label>
+        <div class="index-progress-note">
+          Off (default): untitled sessions, usually tests or incomplete runs, are folded into a “quiet sessions” group.
+          On: all sessions appear in one list, newest first.
+        </div>
       </section>
 
       <!-- Debug logging -->

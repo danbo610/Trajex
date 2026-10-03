@@ -4,6 +4,7 @@
 
 ### Added
 
+- Settings → Sessions list → "Show untitled sessions" (off by default): when on, untitled/"quiet" sessions are no longer folded away and every session of the active location (Local or remote) is listed together, newest first; takes effect immediately and is persisted in `settings.json` (`showUntitledSessions`).
 - Sessions list rows show the owning agent (Claude Code / Codex / Pi) under the time on the right, as a small dot in the agent's color plus its name; works for local and remote locations and uses the same marker/colors as the session detail page.
 - Remote sources: Settings → Data Sources is split into Local and Remote. A remote is another machine's `.claude` / `.codex` / `.pi/agent/sessions` reached through a mounted folder; it is indexed read-only into its own local database `~/.trajex/remote-<id>.sqlite` (never merged with `trajex.sqlite`), re-scanned every 5 minutes or on demand, and keeps its previous index when unreachable. The sidebar gets a Local / Remote location layer for Sessions and Activity; Memory stays local. Routes are now `/l/:loc/sessions…` and `/l/:loc/activity` (old URLs redirect to `local`). Local file links are disabled in remote sessions.
 

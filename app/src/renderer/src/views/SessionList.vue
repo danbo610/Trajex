@@ -7,6 +7,7 @@ import { computed, ref, onMounted, onUnmounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { state, isRemoteLocation, locationName } from '../store.js';
 import { sourceColor, sourceLabel } from '../source-catalog.mjs';
+import { groupSessions } from '../session-list-groups.mjs';
 import { highlightPlain, escapeHTML, formatProjectLabel, fmtListTime, fmtRelative } from '../utils.js';
 
 defineOptions({ name: 'SessionList' });
@@ -48,12 +49,10 @@ const visibleSessions = computed(() => {
 const showProjectPrefix = computed(() => state.projectFilter === 'all');
 const showNoise = ref(false);
 
-function isNoise(s) {
-  return !s.title;
-}
-
-const normalSessions = computed(() => visibleSessions.value.filter(s => !isNoise(s)));
-const noiseSessions = computed(() => visibleSessions.value.filter(s => isNoise(s)));
+// Untitled sessions are folded into a "quiet" group unless Settings > "Show untitled sessions" is on.
+const groups = computed(() => groupSessions(visibleSessions.value, { showUntitled: state.showUntitledSessions }));
+const normalSessions = computed(() => groups.value.normal);
+const noiseSessions = computed(() => groups.value.noise);
 
 function titleHTML(session) {
   return highlightPlain(session.title || '(untitled)', state.query.trim());
@@ -172,7 +171,7 @@ function trajexStyle(session) {
       >
         <div class="srow-trajex" :style="trajexStyle(s)"></div>
         <div class="srow-body">
-          <div class="srow-title" v-html="titleHTML(s)"></div>
+          <div class="srow-title" :class="{ untitled: !s.title }" v-html="titleHTML(s)"></div>
           <div class="srow-meta">
             <template v-if="showProjectPrefix">
               <span class="project-tag" v-html="projectLabel(s)"></span>
@@ -298,6 +297,8 @@ function trajexStyle(session) {
   padding: 0 2px;
   border-radius: 2px;
 }
+
+.srow-title.untitled { color: var(--muted); font-style: italic; }
 
 .srow-meta {
   font-family: var(--font-mono);

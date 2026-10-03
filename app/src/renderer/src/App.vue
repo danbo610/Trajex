@@ -250,6 +250,7 @@ async function loadSourceDots() {
   sourceDots.value = (s.sources || []).map(src => ({ id: src.id, status: src.status, color: src.color }));
   sourceDetails.value = s.sources || [];
   state.sources = s.sources || [];
+  state.showUntitledSessions = s.showUntitledSessions === true;
 }
 loadSourceDots();
 
