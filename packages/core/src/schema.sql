@@ -253,3 +253,15 @@ END;
 CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project);
 CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
 CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
+
+-- ============================================================
+-- 14. 会话覆盖表：用户自定义标题与软隐藏（仅 Trajex 自己的索引库，不改动任何 transcript）
+--     与 memories 一样属于 durable 层：force rebuild 的清理语句不会触碰它，
+--     App 的临时库重建会把它从旧库复制过来。session_id 与 sessions.id 同键
+--     （每个 location 一个独立 SQLite，因此不会跨机器碰撞）。
+-- ============================================================
+CREATE TABLE IF NOT EXISTS session_overrides (
+  session_id TEXT PRIMARY KEY,     -- 对应 sessions.id
+  custom_title TEXT,               -- 用户自定义标题（NULL = 使用原标题）
+  hidden_at INTEGER,               -- 软隐藏时间（epoch ms；NULL = 可见）
+  updated_at INTEGER);             -- 最后修改时间（epoch ms）

@@ -5,13 +5,15 @@
 <script setup>
 import { ref, shallowRef, computed, reactive, onMounted, onBeforeUnmount, onUnmounted, nextTick, watch } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
-import { state, FOLDER_SVG, getSessionSummary, isRemoteLocation } from '../store.js';
+import { state, FOLDER_SVG, getSessionSummary, isRemoteLocation, findSessionById, locationPath } from '../store.js';
 import {
   fetchSessionDetailPatch,
   getCachedSessionDetail,
   loadSessionDetail,
   loadFullText,
   materializeSessionDetailPatch,
+  renameSession,
+  setSessionHidden,
 } from '../data.js';
 import { clearSessionDirty, consumeGlobalSessionDirty, liveSessionKey, markSessionDirty } from '../session-live.mjs';
 import { applySnapshot } from '../session-timeline.mjs';
@@ -49,6 +51,53 @@ const liveSessionMetadata = shallowRef(null);
 const session = computed(() => (
   liveSessionMetadata.value || getSessionSummary(props.id)
 ));
+// --- Rename / hide (Trajex index DB only; transcripts are never modified) ---
+const renaming = ref(false);
+const renameDraft = ref('');
+const titleInputRef = ref(null);
+const actionError = ref('');
+const isHidden = computed(() => state.hiddenSessions.some(item => item.id === props.id));
+
+async function startRename() {
+  actionError.value = '';
+  renameDraft.value = session.value?.title || '';
+  renaming.value = true;
+  await nextTick();
+  titleInputRef.value?.focus();
+  titleInputRef.value?.select();
+}
+
+function cancelRename() {
+  renaming.value = false;
+}
+
+async function commitRename() {
+  if (!renaming.value) return;
+  const next = renameDraft.value.trim();
+  renaming.value = false;
+  if (next === (session.value?.title || '')) return;
+  try {
+    const result = await renameSession(props.id, next || null, location);
+    if (liveSessionMetadata.value) {
+      liveSessionMetadata.value = { ...liveSessionMetadata.value, title: result.title, renamed: result.customTitle !== null };
+    }
+  } catch (error) {
+    actionError.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function toggleHide() {
+  actionError.value = '';
+  const hide = !isHidden.value;
+  try {
+    await setSessionHidden(props.id, hide, location);
+    // A hidden session leaves the normal list; go back to it. Restoring stays on the page.
+    if (hide) router.push(locationPath(location, 'sessions'));
+  } catch (error) {
+    actionError.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
 const messages = shallowRef([]);
 const summaries = shallowRef([]);
 const timelineItems = shallowRef([]);
@@ -305,7 +354,7 @@ async function revealColdTimeline(revision, sessionId) {
 async function fetchSessionSnapshot(sessionId, { force = false } = {}) {
   const messageSnapshot = force ? null : getCachedSessionDetail(sessionId, location);
   if (messageSnapshot) return messageSnapshot;
-  const cached = state.sessions.find(session => session.id === sessionId);
+  const cached = findSessionById(sessionId);
   if (cached && (force || !cached.messages || cached.messages.length === 0)) {
     return loadSessionDetail(sessionId, location);
   }
@@ -607,7 +656,36 @@ function navigateToSubagent(agentId) {
               via {{ sourceLabel(session.source, state.sources) }}
             </span>
           </div>
-          <div class="session-title">{{ session.title || '(untitled)' }}</div>
+          <div class="session-title-row">
+            <input
+              v-if="renaming"
+              ref="titleInputRef"
+              v-model="renameDraft"
+              class="session-title-input"
+              type="text"
+              maxlength="200"
+              spellcheck="false"
+              placeholder="Session title (empty = original)"
+              @keydown.enter.prevent="commitRename"
+              @keydown.esc.prevent.stop="cancelRename"
+              @blur="cancelRename"
+            />
+            <div
+              v-else
+              class="session-title"
+              :class="{ untitled: !session.title }"
+              title="Click to rename"
+              @click="startRename"
+            >{{ session.title || '(untitled)' }}</div>
+            <button v-if="!renaming" class="session-action" type="button" title="Rename" aria-label="Rename session" @click="startRename">
+              <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.5 2.5l3 3L5.5 13.5H2.5v-3l8-8z"/></svg>
+            </button>
+            <button class="session-action" type="button" :title="isHidden ? 'Restore this session to the list' : 'Hide this session from lists (files stay untouched)'" @click="toggleHide">
+              {{ isHidden ? 'Restore' : 'Hide' }}
+            </button>
+          </div>
+          <div v-if="isHidden" class="session-hidden-note">This session is hidden from the Sessions list and counts.</div>
+          <div v-if="actionError" class="session-hidden-note error">{{ actionError }}</div>
           <div class="session-meta-inline">
             <span>created {{ fmtRelative(new Date(session.started_at || 0).getTime()) }}</span>
             <span class="dot"></span>

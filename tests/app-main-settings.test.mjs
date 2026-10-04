@@ -1280,3 +1280,80 @@ test('settings rebuild cancels an in-flight background build instead of waiting 
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test('session rename / hide IPC applies overrides to lists, metadata, counts and projects', async () => {
+  const originalHome = process.env.HOME;
+  const home = join(tmpdir(), `trajex-main-overrides-${Date.now()}`);
+  const trajexDir = join(home, '.trajex');
+  mkdirSync(trajexDir, { recursive: true });
+  process.env.HOME = home;
+
+  const setup = new DatabaseSync(join(trajexDir, 'trajex.sqlite'));
+  setup.exec(readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8'));
+  const insert = setup.prepare('INSERT INTO sessions (id, title, project, started_at, ended_at, source) VALUES (?, ?, ?, ?, ?, ?)');
+  insert.run('s-untitled', null, '-tmp-p', '2026-10-01T10:00:00Z', '2026-10-01T10:00:00Z', 'codex');
+  insert.run('s-titled', 'Original', '-tmp-p', '2026-10-02T10:00:00Z', '2026-10-02T10:00:00Z', 'claude');
+  insert.run('s-other', 'Other', '-tmp-q', '2026-10-03T10:00:00Z', '2026-10-03T10:00:00Z', 'claude');
+  setup.close();
+
+  const ipcHandlers = new Map();
+  const sent = [];
+  class FakeBrowserWindow {
+    constructor() {
+      this.webContents = { on() {}, setZoomLevel() {}, setWindowOpenHandler() {}, openDevTools() {}, send(channel, payload) { sent.push([channel, payload]); } };
+    }
+    loadFile() {}
+    loadURL() {}
+    close() {}
+    static getAllWindows() { return [new FakeBrowserWindow()]; }
+    static fromWebContents() { return null; }
+  }
+  const restore = registerMocks([
+    [ELECTRON_URL, { namedExports: electronNamespace({ BrowserWindow: FakeBrowserWindow, ipcMain: { handle(channel, handler) { ipcHandlers.set(channel, handler); } } }) }],
+    [DATABASE_URL, { defaultExport: SqliteCompatDatabase }],
+    [PARCEL_WATCHER_URL, { defaultExport: noopParcelWatcher() }],
+    [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
+    [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
+    [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
+  ]);
+
+  try {
+    await importMain();
+    const call = (channel, ...args) => ipcHandlers.get(channel)(null, ...args);
+    const ids = (opts) => call('db:getSessions', { source: 'all', ...opts }).map(row => row.id);
+
+    assert.deepEqual(ids(), ['s-other', 's-titled', 's-untitled']);
+
+    const renamed = call('sessions:rename', 's-untitled', '  Investigate   flaky test ', 'local');
+    assert.equal(renamed.title, 'Investigate flaky test');
+    const row = call('db:getSessions', { source: 'all' }).find(item => item.id === 's-untitled');
+    assert.equal(row.title, 'Investigate flaky test');
+    assert.equal(row.source, 'codex');
+    assert.equal(Number(row.renamed), 1);
+    assert.equal(call('db:getSessionPatch', 's-untitled', { messages: {}, toolCalls: {}, toolResults: {}, subagents: {}, workflows: {}, summaries: {} }).session.title, 'Investigate flaky test');
+
+    call('sessions:setHidden', 's-titled', true, 'local');
+    assert.deepEqual(ids(), ['s-other', 's-untitled']);
+    assert.deepEqual(ids({ hidden: 'only' }), ['s-titled']);
+    assert.deepEqual(ids({ hidden: 'all' }), ['s-other', 's-titled', 's-untitled']);
+    assert.equal(call('db:getStats', { source: 'all' }).sessions, 2);
+    assert.equal(call('db:getStats', {}).sessions, 1, 'default (claude) scope: 1 visible claude session left');
+    assert.equal(call('db:getProjects', { source: 'all' }).find(p => p.project === '-tmp-p').session_count, 1);
+    assert.equal(call('locations:list').find(l => l.id === 'local').sessionCount, 2);
+    assert.ok(sent.some(([channel]) => channel === 'trajex:index-updated'), 'windows are told to refresh');
+    // The detail page can still open a hidden session.
+    assert.equal(call('db:getSessionPatch', 's-titled', { messages: {}, toolCalls: {}, toolResults: {}, subagents: {}, workflows: {}, summaries: {} }).session.title, 'Original');
+
+    call('sessions:setHidden', 's-titled', false, 'local');
+    assert.deepEqual(ids(), ['s-other', 's-titled', 's-untitled']);
+    call('sessions:rename', 's-untitled', '', 'local');
+    assert.equal(call('db:getSessions', { source: 'all' }).find(item => item.id === 's-untitled').title, null);
+
+    assert.throws(() => call('sessions:rename', 'nope', 'x', 'local'), /not found/i);
+    assert.throws(() => call('sessions:rename', 's-other', 'x', '../evil'), /location/i);
+  } finally {
+    restore();
+    process.env.HOME = originalHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});

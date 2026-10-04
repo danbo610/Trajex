@@ -10,6 +10,10 @@ import { reactive, shallowReactive, markRaw } from 'vue';
 export const state = reactive({
   memories: [],
   sessions: [],
+  // Soft-hidden sessions of the active location (Sessions list > Hidden view). Never mixed into `sessions`.
+  hiddenSessions: [],
+  // Sessions list shows the hidden sessions instead of the normal list.
+  showHiddenSessions: false,
   sessionTitleOverrides: shallowReactive(new Map()),
   projects: [],
   sources: [],
@@ -51,6 +55,8 @@ export function setLocation(id) {
   if (state.location === next) return false;
   state.location = next;
   state.sessions = [];
+  state.hiddenSessions = [];
+  state.showHiddenSessions = false;
   state.projects = [];
   state.stats = {};
   state.loaded = false;
@@ -68,9 +74,16 @@ export function locationPath(id, section = 'sessions') {
   return `/l/${encodeURIComponent(id || LOCAL_LOCATION)}/${section}`;
 }
 
+/** Visible sessions first, then hidden ones (a hidden session can still be opened from the Hidden view). */
+export function findSessionById(sessionId) {
+  const id = String(sessionId || '');
+  return state.sessions.find(candidate => candidate.id === id)
+    || state.hiddenSessions.find(candidate => candidate.id === id);
+}
+
 export function getSessionSummary(sessionId) {
   const id = String(sessionId || '');
-  const session = state.sessions.find(candidate => candidate.id === id);
+  const session = findSessionById(id);
   const title = state.sessionTitleOverrides.get(id);
   if (title === undefined) return session;
   return { ...(session || { id }), title };

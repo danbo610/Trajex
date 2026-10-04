@@ -3,11 +3,12 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 
 <script setup>
-import { computed, ref, onMounted, onUnmounted } from 'vue';
+import { computed, ref, nextTick, onMounted, onUnmounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { state, isRemoteLocation, locationName } from '../store.js';
 import { sourceColor, sourceLabel } from '../source-catalog.mjs';
 import { groupSessions } from '../session-list-groups.mjs';
+import { renameSession, setSessionHidden } from '../data.js';
 import { highlightPlain, escapeHTML, formatProjectLabel, fmtListTime, fmtRelative } from '../utils.js';
 
 defineOptions({ name: 'SessionList' });
@@ -20,14 +21,95 @@ function onKeydown(e) {
     debugEmpty.value = !debugEmpty.value;
   }
 }
-onMounted(() => window.addEventListener('keydown', onKeydown));
-onUnmounted(() => window.removeEventListener('keydown', onKeydown));
+function closeMenu() { menu.value = null; }
+function onMenuKeydown(e) { if (e.key === 'Escape' && menu.value) closeMenu(); }
+onMounted(() => {
+  window.addEventListener('keydown', onKeydown);
+  window.addEventListener('keydown', onMenuKeydown);
+  window.addEventListener('click', closeMenu);
+  window.addEventListener('blur', closeMenu);
+});
+onUnmounted(() => {
+  window.removeEventListener('keydown', onKeydown);
+  window.removeEventListener('keydown', onMenuKeydown);
+  window.removeEventListener('click', closeMenu);
+  window.removeEventListener('blur', closeMenu);
+});
+
+// --- Rename / hide (stored only in Trajex's own index DB, never in the transcripts) ---
+const menu = ref(null);          // { x, y, session }
+const renamingId = ref(null);
+const renameDraft = ref('');
+const actionError = ref('');
+
+function openMenu(event, session) {
+  const width = 176;
+  const height = session.renamed ? 112 : 80;
+  menu.value = {
+    session,
+    x: Math.max(8, Math.min(event.clientX, window.innerWidth - width - 8)),
+    y: Math.max(8, Math.min(event.clientY, window.innerHeight - height - 8)),
+  };
+}
+
+function openMenuFromButton(event, session) {
+  const rect = event.currentTarget.getBoundingClientRect();
+  openMenu({ clientX: rect.right - 176, clientY: rect.bottom + 4 }, session);
+}
+
+async function startRename(session) {
+  closeMenu();
+  actionError.value = '';
+  renamingId.value = session.id;
+  renameDraft.value = session.title || '';
+  await nextTick();
+  const input = document.querySelector(`.srow[data-session-id="${CSS.escape(session.id)}"] .srow-rename`);
+  input?.focus();
+  input?.select();
+}
+
+function cancelRename() {
+  renamingId.value = null;
+}
+
+async function commitRename(session) {
+  if (renamingId.value !== session.id) return;
+  const next = renameDraft.value.trim();
+  renamingId.value = null;
+  // Unchanged text is a no-op; empty text reverts to the original title.
+  if (next === (session.title || '')) return;
+  try {
+    await renameSession(session.id, next || null);
+  } catch (error) {
+    actionError.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function resetTitle(session) {
+  closeMenu();
+  try {
+    await renameSession(session.id, null);
+  } catch (error) {
+    actionError.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function toggleHidden(session, hidden) {
+  closeMenu();
+  actionError.value = '';
+  try {
+    await setSessionHidden(session.id, hidden);
+  } catch (error) {
+    actionError.value = error instanceof Error ? error.message : String(error);
+  }
+}
 
 const homePath = (typeof process !== 'undefined' && process.env?.HOME) || '~';
 
 const visibleSessions = computed(() => {
   const q = state.query.trim().toLowerCase();
-  return state.sessions
+  // The Hidden view lists the soft-hidden sessions instead of the normal list.
+  return (state.showHiddenSessions ? state.hiddenSessions : state.sessions)
     .filter(s => state.projectFilter === 'all' || s.project === state.projectFilter)
     .filter(s => state.sourceFilter === 'all' || (s.source || 'claude') === state.sourceFilter)
     .map(s => {
@@ -50,7 +132,7 @@ const showProjectPrefix = computed(() => state.projectFilter === 'all');
 const showNoise = ref(false);
 
 // Untitled sessions are folded into a "quiet" group unless Settings > "Show untitled sessions" is on.
-const groups = computed(() => groupSessions(visibleSessions.value, { showUntitled: state.showUntitledSessions }));
+const groups = computed(() => groupSessions(visibleSessions.value, { showUntitled: state.showUntitledSessions || state.showHiddenSessions }));
 const normalSessions = computed(() => groups.value.normal);
 const noiseSessions = computed(() => groups.value.noise);
 
@@ -105,8 +187,29 @@ function trajexStyle(session) {
 
 <template>
   <div class="session-list-wrap">
+    <!-- Hidden sessions: soft-deleted, recoverable -->
+    <div v-if="state.loaded && (state.hiddenSessions.length || state.showHiddenSessions)" class="hidden-bar" :class="{ active: state.showHiddenSessions }">
+      <template v-if="!state.showHiddenSessions">
+        <span>{{ state.hiddenSessions.length }} hidden {{ state.hiddenSessions.length === 1 ? 'session' : 'sessions' }}</span>
+        <button class="hidden-bar-link" type="button" @click="state.showHiddenSessions = true">Show</button>
+      </template>
+      <template v-else>
+        <span>Hidden sessions ({{ state.hiddenSessions.length }}) — use Restore to bring one back. Files on disk are never touched.</span>
+        <button class="hidden-bar-link" type="button" @click="state.showHiddenSessions = false">Back to sessions</button>
+      </template>
+    </div>
+    <div v-if="actionError" class="hidden-bar error">{{ actionError }}</div>
+
+    <!-- Row context menu -->
+    <div v-if="menu" class="row-menu" :style="{ left: menu.x + 'px', top: menu.y + 'px' }" @click.stop @contextmenu.prevent>
+      <button type="button" @click="startRename(menu.session)">Rename…</button>
+      <button v-if="menu.session.renamed" type="button" @click="resetTitle(menu.session)">Reset to original title</button>
+      <button v-if="state.showHiddenSessions" type="button" @click="toggleHidden(menu.session, false)">Restore</button>
+      <button v-else type="button" @click="toggleHidden(menu.session, true)">Hide</button>
+    </div>
+
     <!-- Remote location without sessions yet -->
-    <div v-if="state.loaded && isRemoteLocation() && !visibleSessions.length && !state.query" class="empty-content">
+    <div v-if="state.loaded && isRemoteLocation() && !visibleSessions.length && !state.query && !state.hiddenSessions.length" class="empty-content">
       <div class="empty-eyebrow">
         <span class="diamond"></span>
         <span>{{ locationName() }}</span>
@@ -165,13 +268,29 @@ function trajexStyle(session) {
         v-for="s in normalSessions"
         :key="s.id"
         class="srow"
-        :class="{ cursor: state.cursorId === s.id }"
+        :class="{ cursor: state.cursorId === s.id, 'is-hidden': state.showHiddenSessions }"
         :data-session-id="s.id"
         @click="openSession(s)"
+        @contextmenu.prevent="openMenu($event, s)"
       >
         <div class="srow-trajex" :style="trajexStyle(s)"></div>
         <div class="srow-body">
-          <div class="srow-title" :class="{ untitled: !s.title }" v-html="titleHTML(s)"></div>
+          <input
+            v-if="renamingId === s.id"
+            v-model="renameDraft"
+            class="srow-rename"
+            type="text"
+            maxlength="200"
+            spellcheck="false"
+            placeholder="Session title (empty = original)"
+            @click.stop
+            @dblclick.stop
+            @keydown.enter.prevent="commitRename(s)"
+            @keydown.esc.prevent.stop="cancelRename"
+            @blur="cancelRename"
+          />
+          <div v-else class="srow-title" :class="{ untitled: !s.title }" v-html="titleHTML(s)"></div>
+          <button class="srow-more" type="button" title="Rename / hide" aria-label="Session actions" @click.stop="openMenuFromButton($event, s)">⋯</button>
           <div class="srow-meta">
             <template v-if="showProjectPrefix">
               <span class="project-tag" v-html="projectLabel(s)"></span>
@@ -208,10 +327,27 @@ function trajexStyle(session) {
           v-for="s in noiseSessions"
           :key="s.id"
           class="srow noise"
+          :data-session-id="s.id"
           @click="openSession(s)"
+          @contextmenu.prevent="openMenu($event, s)"
         >
           <div class="srow-body">
-            <div class="srow-title">(untitled)</div>
+            <input
+              v-if="renamingId === s.id"
+              v-model="renameDraft"
+              class="srow-rename"
+              type="text"
+              maxlength="200"
+              spellcheck="false"
+              placeholder="Session title (empty = original)"
+              @click.stop
+              @dblclick.stop
+              @keydown.enter.prevent="commitRename(s)"
+              @keydown.esc.prevent.stop="cancelRename"
+              @blur="cancelRename"
+            />
+            <div v-else class="srow-title untitled">(untitled)</div>
+            <button class="srow-more" type="button" title="Rename / hide" aria-label="Session actions" @click.stop="openMenuFromButton($event, s)">⋯</button>
             <div class="srow-meta">
               <template v-if="showProjectPrefix">
                 <span class="project-tag" v-html="projectLabel(s)"></span>
@@ -298,6 +434,48 @@ function trajexStyle(session) {
   border-radius: 2px;
 }
 
+.srow-body { position: relative; }
+.srow-more {
+  position: absolute; top: -3px; right: 0;
+  width: 24px; height: 22px; line-height: 18px; padding: 0;
+  border: 1px solid var(--hairline); border-radius: 4px;
+  background: var(--surface, #1a1a1d); color: var(--muted);
+  font-size: 15px; cursor: pointer; opacity: 0;
+  transition: opacity 0.08s, color 0.08s;
+}
+.srow:hover .srow-more, .srow-more:focus-visible { opacity: 1; }
+.srow-more:hover { color: var(--fg); }
+.srow-rename {
+  width: 100%; box-sizing: border-box;
+  font: inherit; font-size: 13px; color: var(--fg);
+  background: var(--surface, #1a1a1d);
+  border: 1px solid var(--accent, #a78bfa); border-radius: 4px;
+  padding: 2px 6px; margin: -3px 0 3px; outline: none;
+}
+.hidden-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 7px 16px; font-size: 11.5px; color: var(--muted);
+  border-bottom: 1px solid var(--hairline); flex-shrink: 0;
+}
+.hidden-bar.active { color: var(--fg-2); background: rgba(251,191,36,0.06); }
+.hidden-bar.error { color: #f87171; }
+.hidden-bar-link {
+  background: none; border: none; padding: 0; font: inherit; cursor: pointer;
+  color: var(--accent-2, #c4b5fd); border-bottom: 1px solid rgba(167,139,250,0.4);
+}
+.row-menu {
+  position: fixed; z-index: 50; min-width: 176px; padding: 4px;
+  background: var(--surface, #1a1a1d); border: 1px solid var(--hairline-2, var(--hairline));
+  border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+  display: flex; flex-direction: column;
+}
+.row-menu button {
+  text-align: left; background: none; border: none; color: var(--fg-2);
+  font: inherit; font-size: 12.5px; padding: 6px 10px; border-radius: 4px; cursor: pointer;
+}
+.row-menu button:hover { background: rgba(255,255,255,0.07); color: var(--fg); }
+[data-theme='light'] .row-menu button:hover { background: rgba(0,0,0,0.06); }
+.srow.is-hidden .srow-title { opacity: 0.7; }
 .srow-title.untitled { color: var(--muted); font-style: italic; }
 
 .srow-meta {

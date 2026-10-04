@@ -6,7 +6,7 @@
 // All DB access goes through this module.
 
 import { markRaw } from 'vue';
-import { state } from './store.js';
+import { state, findSessionById } from './store.js';
 import { mergeLocations } from './location-counts.mjs';
 import { liveSessionKey } from './session-live.mjs';
 import {
@@ -40,7 +40,7 @@ function sessionMetadata(session) {
 }
 
 function commitStoredSessionMetadata(sessionId, metadata) {
-  const session = state.sessions.find(candidate => candidate.id === sessionId);
+  const session = findSessionById(sessionId);
   if (session?.messages?.length) session.messages = markRaw([]);
   const visibleTitle = state.sessionTitleOverrides.get(sessionId) ?? session?.title;
   if (metadata?.title !== undefined && metadata.title !== visibleTitle) {
@@ -55,13 +55,58 @@ function commitStoredSessionMetadata(sessionId, metadata) {
 export async function fetchInitialData() {
   const location = state.location;
   const remote = location !== 'local';
-  const [rawMemories, rawSessions, stats, projects] = await Promise.all([
+  const [rawMemories, rawSessions, rawHidden, stats, projects] = await Promise.all([
     window.trajex.getMemories(),
     window.trajex.getSessions({ source: 'all', limit: 1000, location }),
+    window.trajex.getSessions({ source: 'all', limit: 1000, location, hidden: 'only' }),
     window.trajex.getStats({ location, ...(remote ? { source: 'all' } : {}) }),
     window.trajex.getProjects({ location, ...(remote ? { source: 'all' } : {}) })
   ]);
-  return { rawMemories, rawSessions, stats, projects, location };
+  return { rawMemories, rawSessions, rawHidden, stats, projects, location };
+}
+
+/**
+ * Rename a session (title null/'' = back to the original title). The change is stored in
+ * the location's own index DB only, then mirrored into the renderer state right away.
+ */
+export async function renameSession(sessionId, title, location = state.location) {
+  const result = await window.trajex.renameSession(sessionId, title, location);
+  if (location === state.location) {
+    for (const list of [state.sessions, state.hiddenSessions]) {
+      const index = list.findIndex(candidate => candidate.id === sessionId);
+      if (index === -1) continue;
+      list[index] = { ...list[index], title: result.title, renamed: result.customTitle !== null };
+    }
+    // A live detail overlay would otherwise keep showing the old title.
+    state.sessionTitleOverrides.delete(sessionId);
+  }
+  // Cached detail snapshots carry session metadata (incl. the title) that wins over the list entry.
+  const snapshot = sessionMessageSnapshots.get(snapshotKey(sessionId, location));
+  if (snapshot?.session) {
+    snapshot.session = markRaw({ ...snapshot.session, title: result.title, renamed: result.customTitle !== null });
+  }
+  return result;
+}
+
+/** Hide (soft delete) or restore a session; nothing on disk is touched. */
+export async function setSessionHidden(sessionId, hidden, location = state.location) {
+  const result = await window.trajex.setSessionHidden(sessionId, hidden, location);
+  if (location === state.location) {
+    const from = hidden ? state.sessions : state.hiddenSessions;
+    const index = from.findIndex(candidate => candidate.id === sessionId);
+    if (index !== -1) {
+      const [moved] = from.splice(index, 1);
+      const entry = { ...moved, hidden_at: hidden ? Date.now() : null };
+      const to = hidden ? state.hiddenSessions : state.sessions;
+      to.push(entry);
+      to.sort((a, b) => (
+        new Date(b.ended_at || b.started_at || 0).getTime() - new Date(a.ended_at || a.started_at || 0).getTime()
+      ));
+    }
+    if (!state.hiddenSessions.length) state.showHiddenSessions = false;
+  }
+  void loadLocations();
+  return result;
 }
 
 /** Sidebar location list (Local + configured remotes with index status). */
@@ -76,7 +121,7 @@ export async function loadLocations() {
 }
 
 /** Commit a fetched global catalogue snapshot to shared renderer state. */
-export function commitInitialData({ rawMemories, rawSessions, stats, projects, location = 'local' }) {
+export function commitInitialData({ rawMemories, rawSessions, rawHidden, stats, projects, location = 'local' }) {
   // Transform memories: DB records -> render-layer shape
   state.memories = (rawMemories || []).map(m => ({
     ...m,
@@ -102,6 +147,8 @@ export function commitInitialData({ rawMemories, rawSessions, stats, projects, l
     };
   });
 
+  state.hiddenSessions = (rawHidden || []).map(s => ({ ...s, messages: [] }));
+  if (!state.hiddenSessions.length) state.showHiddenSessions = false;
   state.projects = projects || [];
   state.stats = stats || {};
   state.loaded = true;
@@ -128,7 +175,7 @@ export async function loadSessionDetail(sessionId, location = 'local') {
     workflows: detail.workflows,
     summaries: detail.summaries,
   };
-  const metadata = sessionMetadata(state.sessions.find(candidate => candidate.id === sessionId));
+  const metadata = sessionMetadata(findSessionById(sessionId));
   rememberSessionMessageSnapshot(snapshotKey(sessionId, location), {
     snapshot,
     cursor: createSessionPatchCursor(snapshot),
@@ -184,7 +231,7 @@ export function getCachedSessionDetail(sessionId, location = 'local') {
 }
 
 function commitSessionDetail(sessionId, { messages, workflows = [], summaries = [] }, { updateStore, metadata = null }) {
-  const session = state.sessions.find(candidate => candidate.id === sessionId);
+  const session = findSessionById(sessionId);
   const assembled = {
     ...(session || {}),
     ...(metadata || {}),

@@ -42,3 +42,13 @@ test('toggling does not change the location counts (they come from the index sum
   // Sessions-row badge counts the whole loaded list, folded or not.
   assert.equal(sessions.length, 4);
 });
+
+test('a renamed untitled session counts as titled (no longer folded as quiet)', () => {
+  const list = [
+    { id: 'x', title: 'Now named', renamed: 1 },
+    { id: 'y', title: '' },
+  ];
+  const { normal, noise } = groupSessions(list);
+  assert.deepEqual(normal.map(s => s.id), ['x']);
+  assert.deepEqual(noise.map(s => s.id), ['y']);
+});

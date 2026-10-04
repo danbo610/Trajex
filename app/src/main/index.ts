@@ -11,6 +11,13 @@ import Database from 'better-sqlite3';
 import { writeHeartbeat } from './indexer.ts';
 import { createIndexerService } from './indexer-service.ts';
 import { createWorkerBuildIndex } from './indexer-worker-client.ts';
+import {
+  cleanCustomTitle,
+  normalizeHiddenMode,
+  notHiddenCondition,
+  sessionRowsQuery,
+  setSessionOverride,
+} from './session-overrides.ts';
 import { createIndexLog, isDebugLoggingEnabled } from './remote-index-log.ts';
 import { createStallWatchdog, type IndexEvent, type IndexProgress } from './index-progress.ts';
 import { formatElapsed } from '../shared/index-progress.mjs';
@@ -669,7 +676,7 @@ function readRemoteIndexInfo(id: string) {
   try {
     const handle = dbFor(id);
     if (handle) {
-      sessionCount = handle.prepare('SELECT COUNT(*) AS c FROM sessions').get()?.c || 0;
+      sessionCount = handle.prepare(`SELECT COUNT(*) AS c FROM sessions s ${notHiddenSql(handle, 's', 'WHERE')}`).get()?.c || 0;
       const marker = handle.prepare("SELECT mtime FROM index_state WHERE jsonl_path = '__last_build__'").get();
       if (marker?.mtime) lastIndexedAt = new Date(Number(marker.mtime)).toISOString();
     }
@@ -719,7 +726,7 @@ async function summarizeRemote(remote: RemoteSource, { checkPaths = false } = {}
 
 function listLocations() {
   const localCount = (() => {
-    try { return db?.prepare('SELECT COUNT(*) AS c FROM sessions').get()?.c || 0; } catch { return 0; }
+    try { return db?.prepare(`SELECT COUNT(*) AS c FROM sessions s ${notHiddenSql(db, 's', 'WHERE')}`).get()?.c || 0; } catch { return 0; }
   })();
   return [
     { id: LOCAL_LOCATION, name: 'Local', kind: 'local', sessionCount: localCount, status: 'ok', statusText: '', error: '' },
@@ -930,7 +937,7 @@ function querySessionDisplaySnapshot(sessionId: string, location?: unknown): Ses
   };
 }
 
-const SESSION_METADATA_COLUMNS = [
+const SESSION_METADATA_COLUMN_LIST = [
   'id',
   'title',
   'project',
@@ -942,13 +949,22 @@ const SESSION_METADATA_COLUMNS = [
   'message_count',
   'jsonl_path',
   'source',
-].join(', ');
+];
+const SESSION_METADATA_COLUMNS = SESSION_METADATA_COLUMN_LIST.join(', ');
+
+/** ' WHERE <not hidden>' / ' AND <not hidden>' / '' (hidden sessions are excluded from counts). */
+function notHiddenSql(d: any, alias: string, keyword: 'WHERE' | 'AND'): string {
+  const condition = notHiddenCondition(d, alias);
+  return condition ? `${keyword} ${condition}` : '';
+}
 
 function querySessionMetadata(sessionId: string, location?: unknown): SessionMetadata | null {
   const d = dbFor(location);
   if (!d) return null;
+  // Detail pages also open hidden sessions (from the Hidden view), so no hidden filter here.
+  const query = sessionRowsQuery(d, SESSION_METADATA_COLUMN_LIST, 'all');
   return (
-    d.prepare(`SELECT ${SESSION_METADATA_COLUMNS} FROM sessions WHERE id = ?`).get(sessionId) as SessionMetadata | undefined
+    d.prepare(`${query.select} WHERE s.id = ?`).get(sessionId) as SessionMetadata | undefined
   ) || null;
 }
 
@@ -959,7 +975,11 @@ ipcMain.handle('db:getSessions', (_, opts = {}) => {
   if (!Number.isSafeInteger(limit) || limit < 0) {
     throw new TypeError('limit must be a non-negative integer');
   }
-  let sql = `SELECT ${SESSION_METADATA_COLUMNS} FROM sessions`;
+  // Titles come with the user's custom title applied; hidden sessions are excluded unless
+  // the caller asks for `hidden: 'only' | 'all'` (Hidden view).
+  const rows = sessionRowsQuery(d, SESSION_METADATA_COLUMN_LIST, normalizeHiddenMode(opts.hidden));
+  let sql = rows.select;
+  for (const condition of rows.conditions) sql = appendWhere(sql, [], condition);
   const params: unknown[] = [];
   const sourceFilter = sourceWhereClause(opts);
   if (sourceFilter.sql) {
@@ -1137,7 +1157,7 @@ ipcMain.handle('db:getProjects', (_, opts = {}) => {
   return d.prepare(`
     SELECT project, project_path, COUNT(*) as session_count,
            MAX(COALESCE(ended_at, started_at)) as last_active
-    FROM sessions ${where ? `${where} AND` : 'WHERE'} project IS NOT NULL
+    FROM sessions s ${where ? `${where} AND` : 'WHERE'} project IS NOT NULL ${notHiddenSql(d, 's', 'AND')}
     GROUP BY project ORDER BY last_active DESC
   `).all(...sourceFilter.params);
 });
@@ -1147,7 +1167,7 @@ ipcMain.handle('db:getStats', (_, opts = {}) => {
   if (!d) return { sessions: 0, memories: 0, memoriesArchived: 0 };
   const sourceFilter = sourceWhereClause(opts);
   const where = sourceFilter.sql ? `WHERE ${sourceFilter.sql}` : '';
-  const sessions = d.prepare(`SELECT COUNT(*) as c FROM sessions ${where}`).get(...sourceFilter.params)?.c || 0;
+  const sessions = d.prepare(`SELECT COUNT(*) as c FROM sessions s ${where} ${notHiddenSql(d, 's', where ? 'AND' : 'WHERE')}`).get(...sourceFilter.params)?.c || 0;
   const memories = d.prepare('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NULL').get()?.c || 0;
   const memoriesArchived = d.prepare('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NOT NULL').get()?.c || 0;
   return { sessions, memories, memoriesArchived };
@@ -1228,7 +1248,7 @@ ipcMain.handle('settings:get', async () => {
         SELECT COALESCE(source, 'claude') AS source,
                COUNT(*) AS session_count,
                MAX(started_at) AS last_indexed
-        FROM sessions
+        FROM sessions s ${notHiddenSql(db, 's', 'WHERE')}
         GROUP BY COALESCE(source, 'claude')
       `).all();
       for (const row of rows) {
@@ -1302,6 +1322,35 @@ ipcMain.handle('settings:set', async (_, key, value) => {
   }
   return true;
 });
+
+// --- Session overrides (rename / hide) ---
+//
+// Stored only in the index DB of the addressed location (local or a remote's local
+// ~/.trajex/remote-<id>.sqlite). Transcript files and remote shares are never written.
+
+function applySessionOverride(
+  sessionId: unknown,
+  location: unknown,
+  patch: { title?: unknown; hidden?: boolean },
+) {
+  const loc = normalizeLocationId(location);
+  if (loc === null) throw new Error('Unknown location');
+  const d = dbFor(loc);
+  if (!d) throw new Error('Index database for this location is not available yet');
+  const result = setSessionOverride(d, String(sessionId ?? ''), patch);
+  // Counts / lists in every open window refresh through the usual channels.
+  notifyIndexUpdated({ affectedSessionIds: [] }, loc);
+  notifyRemotesUpdated();
+  return result;
+}
+
+ipcMain.handle('sessions:rename', (_, sessionId, title, location) => (
+  applySessionOverride(sessionId, location, { title: cleanCustomTitle(title) })
+));
+
+ipcMain.handle('sessions:setHidden', (_, sessionId, hidden, location) => (
+  applySessionOverride(sessionId, location, { hidden: hidden === true })
+));
 
 // --- Remote location IPC ---
 

@@ -408,6 +408,23 @@
   font-size: 22px; font-weight: 600; color: var(--fg);
   line-height: 1.3; margin-bottom: 14px; letter-spacing: -0.01em;
 }
+.session-title-row { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 14px; }
+.session-title-row .session-title { margin-bottom: 0; cursor: text; flex: 0 1 auto; min-width: 0; }
+.session-title-row .session-title.untitled { color: var(--muted); font-style: italic; }
+.session-title-input {
+  flex: 1; font: inherit; font-size: 20px; font-weight: 600; color: var(--fg);
+  background: var(--surface); border: 1px solid var(--accent, #a78bfa); border-radius: 5px;
+  padding: 2px 8px; outline: none; letter-spacing: -0.01em;
+}
+.session-action {
+  flex-shrink: 0; align-self: center; display: inline-flex; align-items: center; gap: 4px;
+  font-family: var(--font-mono); font-size: 10.5px; color: var(--muted);
+  background: none; border: 1px solid var(--hairline); border-radius: 4px;
+  padding: 3px 8px; cursor: pointer; opacity: 0.75;
+}
+.session-action:hover { color: var(--fg); opacity: 1; }
+.session-hidden-note { font-size: 11.5px; color: #fbbf24; margin: -8px 0 12px; }
+.session-hidden-note.error { color: #f87171; }
 .session-meta-inline {
   display: flex; align-items: center; gap: 10px;
   font-family: var(--font-mono); font-size: var(--text-sm);

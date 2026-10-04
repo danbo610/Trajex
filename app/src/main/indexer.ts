@@ -29,6 +29,7 @@ import { runWriteTransaction, configureConnection, betterSqliteTransactionAdapte
 import { migrateCoreSchemaColumns } from '../../../packages/core/src/schema-migrations.ts';
 import { acquireWriterLease, writerLockPathFor } from '../../../packages/core/src/writer-lease.ts';
 import { runRetryableWriteTransaction, isBeginBusyFailure, hasUnusableTransaction } from '../../../packages/core/src/write-coordinator.ts';
+import { copyOverridesFromDb } from './session-overrides.ts';
 import { createProgressReporter, type IndexEvent, type IndexProgress } from './index-progress.ts';
 import { inferProjectPath } from '../../../packages/core/src/parsing.ts';
 
@@ -267,6 +268,8 @@ function buildIndex({
     try {
       if (preserveDbPath && path.resolve(preserveDbPath) !== path.resolve(dbPath)) {
         copyMemoriesFromDb(db, preserveDbPath);
+        // Custom titles / hidden flags are user data too: carry them into the rebuilt DB.
+        copyOverridesFromDb(db, preserveDbPath, fs.existsSync);
       }
       const defaultHome = os.homedir();
       const compatibilityHome = path.dirname(claudeDir);

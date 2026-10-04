@@ -13,6 +13,8 @@ import type {
 
 contextBridge.exposeInMainWorld('trajex', {
   getSessions: (opts?: unknown) => ipcRenderer.invoke('db:getSessions', opts),
+  renameSession: (id: string, title: string | null, location?: string) => ipcRenderer.invoke('sessions:rename', id, title, location),
+  setSessionHidden: (id: string, hidden: boolean, location?: string) => ipcRenderer.invoke('sessions:setHidden', id, hidden, location),
   getSessionMessages: (id: string, location?: string) => ipcRenderer.invoke('db:getSessionMessages', id, location),
   getSessionToolCalls: (id: string, location?: string) => ipcRenderer.invoke('db:getSessionToolCalls', id, location),
   getSessionToolResults: (id: string, location?: string) => ipcRenderer.invoke('db:getSessionToolResults', id, location),
